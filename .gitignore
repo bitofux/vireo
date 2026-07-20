@@ -1,0 +1,27 @@
+# cmake
+/build/
+/build-*/
+/cmake-build-*/
+/CMakeCache.txt
+/CmakeFiles/
+/CTestTestfile.cmake
+/cmake_install.cmake
+/Testing/
+
+# compilation database
+/compile_commands.json
+
+# compiler output
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# core dump
+core
+core.*
