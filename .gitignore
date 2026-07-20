@@ -3,7 +3,7 @@
 /build-*/
 /cmake-build-*/
 /CMakeCache.txt
-/CmakeFiles/
+/CMakeFiles/
 /CTestTestfile.cmake
 /cmake_install.cmake
 /Testing/
