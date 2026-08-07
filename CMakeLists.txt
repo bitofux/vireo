@@ -21,3 +21,67 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # CTest测试
 include(CTest)
+
+# vireo_result 静态库
+add_library(
+    vireo_result
+    STATIC
+    src/base/result.c
+)
+
+# vireo_result 的公共头文件根目录
+target_include_directories(
+    vireo_result
+    PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# GCC、Clang 和 AppleClang 的严格警告
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        vireo_result
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Werror
+    )
+endif()
+
+# BUILD_TESTING 由 include(CTest) 提供，默认开启
+if (BUILD_TESTING)
+    # vireo_result 单元测试可执行文件
+    add_executable(
+        vireo_result_test
+        tests/base/test_result.c
+    )
+
+    # 测试程序链接被测库
+    target_link_libraries(
+        vireo_result_test
+        PRIVATE
+            vireo_result
+    )
+
+    # 测试代码使用与生产模块相同的严格警告
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            vireo_result_test
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wshadow
+                -Werror
+        )
+    endif()
+
+    # 把可测试文件注册到CTest
+    add_test(
+        NAME vireo_result_test
+        COMMAND vireo_result_test
+    )
+endif()
