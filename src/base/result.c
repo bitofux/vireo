@@ -6,7 +6,7 @@
  * BRIEF   : vireo_result模块的实现
  * -- 将 vireo_result_t 映射为稳定名称
  * -- 将 vireo_result_t 映射为固定英文说明
- * -- 判断结果为类别是否可能表示暂时性失败
+ * -- 判断结果类别是否可能表示暂时性失败
  */
 #include <vireo/base/result.h>
 
@@ -92,7 +92,7 @@ char const *vireo_result_description(vireo_result_t result) {
     }
 }
 
-/* 返回指定 vireo_result_t 类型的枚举值是否重试 */
+/* 判断结果类别是否可能表示暂时性失败 */
 bool vireo_result_is_retryable(vireo_result_t result) {
     return (result == VIREO_RESULT_TIMEOUT || result == VIREO_RESULT_BUSY) ? true : false;
 }

@@ -21,7 +21,7 @@
 // 编译期断言
 _Static_assert(VIREO_OK == 0, "VIREO_OK value changed");
 _Static_assert(VIREO_RESULT_INVALID_ARGUMENT == 1, "VIREO_RESULT_INVALID_ARGUMENT value changed");
-_Static_assert(VIREO_RESULT_RANGE == 2,"VIREO_RESULT_RANGE value changed");
+_Static_assert(VIREO_RESULT_RANGE == 2, "VIREO_RESULT_RANGE value changed");
 _Static_assert(VIREO_RESULT_OVERFLOW == 3, "VIREO_RESULT_OVERFLOW value changed");
 _Static_assert(VIREO_RESULT_NO_MEMORY == 4, "VIREO_RESULT_NO_MEMORY value changed");
 _Static_assert(VIREO_RESULT_NOT_FOUND == 5, "VIREO_RESULT_NOT_FOUND value changed");
