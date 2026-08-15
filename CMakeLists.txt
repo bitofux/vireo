@@ -22,6 +22,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 # CTest测试
 include(CTest)
 
+# 加载 vireo target 的统一严格警告
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vireo_warnings.cmake")
+
 # vireo_result 静态库
 add_library(
     vireo_result
@@ -36,19 +39,8 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# GCC、Clang 和 AppleClang 的严格警告
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(
-        vireo_result
-        PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-            -Wconversion
-            -Wshadow
-            -Werror
-    )
-endif()
+# 为 vireo_result 启用统一严格警告
+vireo_target_enable_warnings(vireo_result)
 
 # vireo_checked 静态库
 add_library (
@@ -64,19 +56,8 @@ target_link_libraries(
         vireo_result
 )
 
-# 编译选项
-if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(
-        vireo_checked
-        PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-            -Wconversion
-            -Wshadow
-            -Werror
-    )
-endif()
+# 为 vireo_checked 启用统一严格警告
+vireo_target_enable_warnings(vireo_checked)
 
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
@@ -93,49 +74,31 @@ if (BUILD_TESTING)
             vireo_result
     )
 
-    # 测试代码使用与生产模块相同的严格警告
-    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(
-            vireo_result_test
-            PRIVATE
-                -Wall
-                -Wextra
-                -Wpedantic
-                -Wconversion
-                -Wshadow
-                -Werror
-        )
-    endif()
+    # 为 vireo_result_test 启用统一严格警告
+    vireo_target_enable_warnings(vireo_result_test)
 
     # 把可测试文件注册到CTest
     add_test(
         NAME vireo_result_test
         COMMAND vireo_result_test
     )
+
     # vireo_checked 单元测试可执行文件
     add_executable(
         vireo_checked_test
         tests/base/test_checked.c
     )
+
     # 测试程序链接被测试的库
     target_link_libraries(
         vireo_checked_test
         PRIVATE
             vireo_checked
     )
-    # 测试代码使用与生产模块相同的严格警告
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(
-            vireo_checked_test
-            PRIVATE
-                -Wall
-                -Wextra
-                -Wpedantic
-                -Wconversion
-                -Wshadow
-                -Werror
-        )
-    endif()
+
+    # 为 vireo_checked_test 启用统一严格警告
+    vireo_target_enable_warnings(vireo_checked_test)
+
     # 注册到CTest
     add_test(
         NAME vireo_checked_test
