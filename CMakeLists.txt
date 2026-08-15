@@ -25,6 +25,9 @@ include(CTest)
 # 加载 vireo target 的统一严格警告
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vireo_warnings.cmake")
 
+# 加载 vireo target 的 sanitizer 配置
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vireo_sanitizers.cmake")
+
 # vireo_result 静态库
 add_library(
     vireo_result
@@ -41,6 +44,9 @@ target_include_directories(
 
 # 为 vireo_result 启用统一严格警告
 vireo_target_enable_warnings(vireo_result)
+
+# 为 vireo_result 应用当前 sanitizer 配置
+vireo_target_enable_sanitizers(vireo_result)
 
 # vireo_checked 静态库
 add_library (
@@ -59,6 +65,9 @@ target_link_libraries(
 # 为 vireo_checked 启用统一严格警告
 vireo_target_enable_warnings(vireo_checked)
 
+# 为 vireo_checked 应用当前 sanitizer 配置
+vireo_target_enable_sanitizers(vireo_checked)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
     # vireo_result 单元测试可执行文件
@@ -76,6 +85,9 @@ if (BUILD_TESTING)
 
     # 为 vireo_result_test 启用统一严格警告
     vireo_target_enable_warnings(vireo_result_test)
+
+    # 为 vireo_result_test 应用当前 sanitizer 配置
+    vireo_target_enable_sanitizers(vireo_result_test)
 
     # 把可测试文件注册到CTest
     add_test(
@@ -98,6 +110,9 @@ if (BUILD_TESTING)
 
     # 为 vireo_checked_test 启用统一严格警告
     vireo_target_enable_warnings(vireo_checked_test)
+
+    # 为 vireo_checked_test 应用当前 sanitizer 配置
+    vireo_target_enable_sanitizers(vireo_checked_test)
 
     # 注册到CTest
     add_test(
