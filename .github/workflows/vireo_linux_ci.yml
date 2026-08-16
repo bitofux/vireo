@@ -1,0 +1,100 @@
+name: Linux CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    name: Debug build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      VIREO_BUILD_DIR: build/debug
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          cc --version
+
+      - name: Configure
+        run: |
+          cmake \
+            -S . \
+            -B "$VIREO_BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DVIREO_ENABLE_ASAN=OFF \
+            -DVIREO_ENABLE_UBSAN=OFF
+      - name: Build
+        run: |
+          cmake \
+            --build "$VIREO_BUILD_DIR" \
+            --parallel
+
+      - name: Test
+        run: |
+          ctest \
+            --test-dir "$VIREO_BUILD_DIR" \
+            --output-on-failure
+
+  sanitizers:
+    name: ASan and UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      VIREO_BUILD_DIR: build/sanitizers
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          cc --version
+
+      - name: Configure
+        run: |
+          cmake \
+            -S . \
+            -B "$VIREO_BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DVIREO_ENABLE_ASAN=ON \
+            -DVIREO_ENABLE_UBSAN=ON
+
+      - name: Build
+        run: |
+          cmake \
+            --build "$VIREO_BUILD_DIR" \
+            --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          ctest \
+            --test-dir "$VIREO_BUILD_DIR" \
+            --output-on-failure
