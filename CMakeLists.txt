@@ -68,6 +68,25 @@ vireo_target_enable_warnings(vireo_checked)
 # 为 vireo_checked 应用当前 sanitizer 配置
 vireo_target_enable_sanitizers(vireo_checked)
 
+# vireo protocol 静态库
+add_library(
+    vireo_protocol
+    STATIC
+    src/protocol/protocol.c
+)
+
+target_include_directories(
+    vireo_protocol
+    PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# 为 vireo_protocol 启用统一严格警告
+vireo_target_enable_warnings(vireo_protocol)
+
+# 为 vireo_protocol 应用当前 sanitizer 配置
+vireo_target_enable_sanitizers(vireo_protocol)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
     # vireo_result 单元测试可执行文件
@@ -118,5 +137,30 @@ if (BUILD_TESTING)
     add_test(
         NAME vireo_checked_test
         COMMAND vireo_checked_test
+    )
+
+    # vireo_protocol 单元测试可执行文件
+    add_executable(
+        vireo_protocol_test
+        tests/protocol/test_protocol.c
+    )
+
+    # 单元测试程序链接被测试的库
+    target_link_libraries(
+        vireo_protocol_test
+        PRIVATE
+            vireo_protocol
+    )
+
+    # 为vireo_protocol_test 启用统一严格警告
+    vireo_target_enable_warnings(vireo_protocol_test)
+
+    # 为 vireo_protocol_test 应用当前 sanitizer 配置
+    vireo_target_enable_sanitizers(vireo_protocol_test)
+
+    # 注册到CTest
+    add_test(
+        NAME vireo_protocol_test
+        COMMAND vireo_protocol_test
     )
 endif()
