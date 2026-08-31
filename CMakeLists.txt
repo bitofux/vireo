@@ -87,6 +87,24 @@ vireo_target_enable_warnings(vireo_protocol)
 # 为 vireo_protocol 应用当前 sanitizer 配置
 vireo_target_enable_sanitizers(vireo_protocol)
 
+# vireo protocol codec 静态库
+add_library(
+    vireo_protocol_codec
+    STATIC
+    src/protocol/codec.c
+)
+# vireo_protocol_codec 的公共接口依赖 protocol 定义和内部返回值类型
+target_link_libraries(
+    vireo_protocol_codec
+    PUBLIC
+        vireo_result
+        vireo_protocol
+)
+# 为 vireo_protocol_codec 启用统一严格警告
+vireo_target_enable_warnings(vireo_protocol_codec)
+# 为 vireo_protocol_codec 应用当前 sanitizer 配置
+vireo_target_enable_sanitizers(vireo_protocol_codec)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
     # vireo_result 单元测试可执行文件
@@ -162,5 +180,28 @@ if (BUILD_TESTING)
     add_test(
         NAME vireo_protocol_test
         COMMAND vireo_protocol_test
+    )
+
+    # vireo_protocol_codec 单元测试可执行文件
+    add_executable(
+        vireo_protocol_codec_test
+        tests/protocol/test_codec.c
+    )
+    # 测试程序链接被测试的 codec 库
+    target_link_libraries(
+        vireo_protocol_codec_test
+        PRIVATE
+            vireo_protocol_codec
+    )
+    # 为 vireo_protocol_codec_test 启用统一严格警告
+    vireo_target_enable_warnings(vireo_protocol_codec_test)
+
+    # 为 vireo_protocol_codec_test 应用当前 sanitizer 配置
+    vireo_target_enable_sanitizers(vireo_protocol_codec_test)
+
+    # 注册到CTest
+    add_test(
+        NAME vireo_protocol_codec_test
+        COMMAND vireo_protocol_codec_test
     )
 endif()
