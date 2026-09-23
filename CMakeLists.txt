@@ -105,6 +105,31 @@ vireo_target_enable_warnings(vireo_protocol_codec)
 # 为 vireo_protocol_codec 应用当前 sanitizer 配置
 vireo_target_enable_sanitizers(vireo_protocol_codec)
 
+# vireo TLV 静态库
+add_library(
+    vireo_tlv
+    STATIC
+    src/protocol/tlv.c
+)
+
+target_include_directories(
+    vireo_tlv
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# 公共头文件使用 result；实现内部使用 checked
+target_link_libraries(
+    vireo_tlv
+    PUBLIC
+        vireo_result
+    PRIVATE
+        vireo_checked
+)
+
+vireo_target_enable_warnings(vireo_tlv)
+vireo_target_enable_sanitizers(vireo_tlv)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
     # vireo_result 单元测试可执行文件
@@ -203,5 +228,24 @@ if (BUILD_TESTING)
     add_test(
         NAME vireo_protocol_codec_test
         COMMAND vireo_protocol_codec_test
+    )
+
+    add_executable(
+        vireo_tlv_test
+        tests/protocol/test_tlv.c
+    )
+
+    target_link_libraries(
+        vireo_tlv_test
+        PRIVATE
+            vireo_tlv
+    )
+
+    vireo_target_enable_warnings(vireo_tlv_test)
+    vireo_target_enable_sanitizers(vireo_tlv_test)
+
+    add_test(
+        NAME vireo_tlv_test
+        COMMAND vireo_tlv_test
     )
 endif()
