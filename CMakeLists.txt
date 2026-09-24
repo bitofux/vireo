@@ -130,6 +130,33 @@ target_link_libraries(
 vireo_target_enable_warnings(vireo_tlv)
 vireo_target_enable_sanitizers(vireo_tlv)
 
+# vireo chunk 静态库
+add_library(
+    vireo_chunk
+    STATIC
+    src/protocol/chunk.c
+)
+
+target_include_directories(
+    vireo_chunk
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# 公共接口依赖 result 和 protocol；实现内部使用 checked
+target_link_libraries(
+    vireo_chunk
+    PUBLIC
+        vireo_result
+        vireo_protocol
+    PRIVATE
+        vireo_checked
+)
+
+# 为 chunk 库启用统一严格警告和 sanitizer
+vireo_target_enable_warnings(vireo_chunk)
+vireo_target_enable_sanitizers(vireo_chunk)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
     # vireo_result 单元测试可执行文件
@@ -247,5 +274,26 @@ if (BUILD_TESTING)
     add_test(
         NAME vireo_tlv_test
         COMMAND vireo_tlv_test
+    )
+    # vireo chunk 单元测试可执行文件
+    add_executable(
+        vireo_chunk_test
+        tests/protocol/test_chunk.c
+    )
+
+    target_link_libraries(
+        vireo_chunk_test
+        PRIVATE
+            vireo_chunk
+    )
+
+    # 为测试程序启用统一严格警告和 sanitizer
+    vireo_target_enable_warnings(vireo_chunk_test)
+    vireo_target_enable_sanitizers(vireo_chunk_test)
+
+    # 注册到 CTest
+    add_test(
+        NAME vireo_chunk_test
+        COMMAND vireo_chunk_test
     )
 endif()
