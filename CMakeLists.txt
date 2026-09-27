@@ -87,6 +87,35 @@ vireo_target_enable_warnings(vireo_protocol)
 # 为 vireo_protocol 应用当前 sanitizer 配置
 vireo_target_enable_sanitizers(vireo_protocol)
 
+# vireo config 静态库
+add_library(
+    vireo_config
+    STATIC
+    src/base/config.c
+)
+
+# vireo_config 的公共头文件根目录
+target_include_directories(
+    vireo_config
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# 公共接口使用 result；实现内部使用 checked arithmetic
+target_link_libraries(
+    vireo_config
+    PUBLIC
+        vireo_result
+    PRIVATE
+        vireo_checked
+)
+
+# 为 vireo_config 启用统一严格警告
+vireo_target_enable_warnings(vireo_config)
+
+# 为 vireo_config 应用当前 sanitizer 配置
+vireo_target_enable_sanitizers(vireo_config)
+
 # vireo protocol codec 静态库
 add_library(
     vireo_protocol_codec
@@ -207,6 +236,31 @@ if (BUILD_TESTING)
     add_test(
         NAME vireo_checked_test
         COMMAND vireo_checked_test
+    )
+
+        # vireo_config 单元测试可执行文件
+    add_executable(
+        vireo_config_test
+        tests/base/test_config.c
+    )
+
+    # 测试程序链接被测试的配置库
+    target_link_libraries(
+        vireo_config_test
+        PRIVATE
+            vireo_config
+    )
+
+    # 为 vireo_config_test 启用统一严格警告
+    vireo_target_enable_warnings(vireo_config_test)
+
+    # 为 vireo_config_test 应用当前 sanitizer 配置
+    vireo_target_enable_sanitizers(vireo_config_test)
+
+    # 注册到 CTest
+    add_test(
+        NAME vireo_config_test
+        COMMAND vireo_config_test
     )
 
     # vireo_protocol 单元测试可执行文件
