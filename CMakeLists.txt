@@ -186,8 +186,46 @@ target_link_libraries(
 vireo_target_enable_warnings(vireo_chunk)
 vireo_target_enable_sanitizers(vireo_chunk)
 
+# 日志公共库：纯格式化、资源生命周期、同步 emit/flush 与单归档轮转
+find_package(Threads REQUIRED)
+add_library(vireo_log STATIC src/base/log.c)
+target_link_libraries(vireo_log PUBLIC vireo_result PRIVATE vireo_checked Threads::Threads)
+vireo_target_enable_warnings(vireo_log)
+vireo_target_enable_sanitizers(vireo_log)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
+    add_executable(vireo_log_test tests/base/test_log.c)
+    target_link_libraries(vireo_log_test PRIVATE vireo_log)
+    vireo_target_enable_warnings(vireo_log_test)
+    vireo_target_enable_sanitizers(vireo_log_test)
+    add_test(NAME vireo_log_test COMMAND vireo_log_test)
+
+    # 资源/emit 测试各自显式取得实现私有 seam；不扩大公共 include 根。
+    add_executable(vireo_log_lifecycle_test tests/base/test_log_lifecycle.c)
+    target_include_directories(vireo_log_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_log_lifecycle_test PRIVATE vireo_log vireo_config)
+    vireo_target_enable_warnings(vireo_log_lifecycle_test)
+    vireo_target_enable_sanitizers(vireo_log_lifecycle_test)
+    add_test(NAME vireo_log_lifecycle_test COMMAND vireo_log_lifecycle_test)
+    set_tests_properties(vireo_log_lifecycle_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_log_emit_test tests/base/test_log_emit.c)
+    target_include_directories(vireo_log_emit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_log_emit_test PRIVATE vireo_log Threads::Threads)
+    vireo_target_enable_warnings(vireo_log_emit_test)
+    vireo_target_enable_sanitizers(vireo_log_emit_test)
+    add_test(NAME vireo_log_emit_test COMMAND vireo_log_emit_test)
+    set_tests_properties(vireo_log_emit_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_log_rotation_test tests/base/test_log_rotation.c)
+    target_include_directories(vireo_log_rotation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_log_rotation_test PRIVATE vireo_log Threads::Threads)
+    vireo_target_enable_warnings(vireo_log_rotation_test)
+    vireo_target_enable_sanitizers(vireo_log_rotation_test)
+    add_test(NAME vireo_log_rotation_test COMMAND vireo_log_rotation_test)
+    set_tests_properties(vireo_log_rotation_test PROPERTIES TIMEOUT 30)
+
     # vireo_result 单元测试可执行文件
     add_executable(
         vireo_result_test
