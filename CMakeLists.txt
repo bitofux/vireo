@@ -199,8 +199,37 @@ target_link_libraries(vireo_buffer PUBLIC vireo_result PRIVATE vireo_checked)
 vireo_target_enable_warnings(vireo_buffer)
 vireo_target_enable_sanitizers(vireo_buffer)
 
+# pool：受检槽位布局、有界生命周期与数值租约
+add_library(vireo_pool STATIC src/base/pool.c)
+target_link_libraries(vireo_pool PUBLIC vireo_result PRIVATE vireo_checked)
+vireo_target_enable_warnings(vireo_pool)
+vireo_target_enable_sanitizers(vireo_pool)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
+    add_executable(vireo_pool_leases_test tests/base/test_pool_leases.c)
+    target_include_directories(vireo_pool_leases_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_pool_leases_test PRIVATE vireo_pool Threads::Threads)
+    vireo_target_enable_warnings(vireo_pool_leases_test)
+    vireo_target_enable_sanitizers(vireo_pool_leases_test)
+    add_test(NAME vireo_pool_leases_test COMMAND vireo_pool_leases_test)
+    set_tests_properties(vireo_pool_leases_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_pool_lifecycle_test tests/base/test_pool_lifecycle.c)
+    target_include_directories(vireo_pool_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_pool_lifecycle_test PRIVATE vireo_pool)
+    vireo_target_enable_warnings(vireo_pool_lifecycle_test)
+    vireo_target_enable_sanitizers(vireo_pool_lifecycle_test)
+    add_test(NAME vireo_pool_lifecycle_test COMMAND vireo_pool_lifecycle_test)
+    set_tests_properties(vireo_pool_lifecycle_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_pool_layout_test tests/base/test_pool_layout.c)
+    target_link_libraries(vireo_pool_layout_test PRIVATE vireo_pool)
+    vireo_target_enable_warnings(vireo_pool_layout_test)
+    vireo_target_enable_sanitizers(vireo_pool_layout_test)
+    add_test(NAME vireo_pool_layout_test COMMAND vireo_pool_layout_test)
+    set_tests_properties(vireo_pool_layout_test PROPERTIES TIMEOUT 30)
+
     add_executable(vireo_buffer_test tests/base/test_buffer.c)
     target_include_directories(vireo_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(vireo_buffer_test PRIVATE vireo_buffer)
