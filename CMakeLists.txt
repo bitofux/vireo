@@ -193,8 +193,38 @@ target_link_libraries(vireo_log PUBLIC vireo_result PRIVATE vireo_checked Thread
 vireo_target_enable_warnings(vireo_log)
 vireo_target_enable_sanitizers(vireo_log)
 
+# buffer：生命周期、字节进度与显式整理/尾部预留/回缩
+add_library(vireo_buffer STATIC src/base/buffer.c)
+target_link_libraries(vireo_buffer PUBLIC vireo_result PRIVATE vireo_checked)
+vireo_target_enable_warnings(vireo_buffer)
+vireo_target_enable_sanitizers(vireo_buffer)
+
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
+    add_executable(vireo_buffer_test tests/base/test_buffer.c)
+    target_include_directories(vireo_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_buffer_test PRIVATE vireo_buffer)
+    vireo_target_enable_warnings(vireo_buffer_test)
+    vireo_target_enable_sanitizers(vireo_buffer_test)
+    add_test(NAME vireo_buffer_test COMMAND vireo_buffer_test)
+    set_tests_properties(vireo_buffer_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_buffer_storage_test tests/base/test_buffer_storage.c)
+    target_include_directories(vireo_buffer_storage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_buffer_storage_test PRIVATE vireo_buffer)
+    vireo_target_enable_warnings(vireo_buffer_storage_test)
+    vireo_target_enable_sanitizers(vireo_buffer_storage_test)
+    add_test(NAME vireo_buffer_storage_test COMMAND vireo_buffer_storage_test)
+    set_tests_properties(vireo_buffer_storage_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_buffer_reuse_test tests/base/test_buffer_reuse.c)
+    target_include_directories(vireo_buffer_reuse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_buffer_reuse_test PRIVATE vireo_buffer)
+    vireo_target_enable_warnings(vireo_buffer_reuse_test)
+    vireo_target_enable_sanitizers(vireo_buffer_reuse_test)
+    add_test(NAME vireo_buffer_reuse_test COMMAND vireo_buffer_reuse_test)
+    set_tests_properties(vireo_buffer_reuse_test PROPERTIES TIMEOUT 30)
+
     add_executable(vireo_log_test tests/base/test_log.c)
     target_link_libraries(vireo_log_test PRIVATE vireo_log)
     vireo_target_enable_warnings(vireo_log_test)
