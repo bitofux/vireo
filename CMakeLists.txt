@@ -217,10 +217,78 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(vireo_event_loop PUBLIC vireo_result vireo_epoll PRIVATE vireo_checked)
     vireo_target_enable_warnings(vireo_event_loop)
     vireo_target_enable_sanitizers(vireo_event_loop)
+
+    # connection：固定双 buffer、独占 socket、有界接收与只读帧识别
+    add_library(vireo_connection STATIC src/net/connection.c)
+    target_link_libraries(vireo_connection
+        PUBLIC vireo_result vireo_buffer vireo_protocol_codec vireo_event_loop PRIVATE vireo_checked)
+    vireo_target_enable_warnings(vireo_connection)
+    vireo_target_enable_sanitizers(vireo_connection)
 endif()
 
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
+    if(TARGET vireo_connection)
+        add_executable(vireo_connection_lifecycle_test tests/net/test_connection_lifecycle.c)
+        target_include_directories(vireo_connection_lifecycle_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_lifecycle_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_lifecycle_test)
+        vireo_target_enable_sanitizers(vireo_connection_lifecycle_test)
+        add_test(NAME vireo_connection_lifecycle_test COMMAND vireo_connection_lifecycle_test)
+        set_tests_properties(vireo_connection_lifecycle_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_receive_test tests/net/test_connection_receive.c)
+        target_include_directories(vireo_connection_receive_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_receive_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_receive_test)
+        vireo_target_enable_sanitizers(vireo_connection_receive_test)
+        add_test(NAME vireo_connection_receive_test COMMAND vireo_connection_receive_test)
+        set_tests_properties(vireo_connection_receive_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_framing_test tests/net/test_connection_framing.c)
+        target_link_libraries(vireo_connection_framing_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_framing_test)
+        vireo_target_enable_sanitizers(vireo_connection_framing_test)
+        add_test(NAME vireo_connection_framing_test COMMAND vireo_connection_framing_test)
+        set_tests_properties(vireo_connection_framing_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_loop_binding_test tests/net/test_connection_loop_binding.c)
+        target_include_directories(vireo_connection_loop_binding_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_loop_binding_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_loop_binding_test)
+        vireo_target_enable_sanitizers(vireo_connection_loop_binding_test)
+        add_test(NAME vireo_connection_loop_binding_test COMMAND vireo_connection_loop_binding_test)
+        set_tests_properties(vireo_connection_loop_binding_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_flow_test tests/net/test_connection_flow.c)
+        target_include_directories(vireo_connection_flow_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_flow_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_flow_test)
+        vireo_target_enable_sanitizers(vireo_connection_flow_test)
+        add_test(NAME vireo_connection_flow_test COMMAND vireo_connection_flow_test)
+        set_tests_properties(vireo_connection_flow_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_close_test tests/net/test_connection_close.c)
+        target_include_directories(vireo_connection_close_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_close_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_close_test)
+        vireo_target_enable_sanitizers(vireo_connection_close_test)
+        add_test(NAME vireo_connection_close_test COMMAND vireo_connection_close_test)
+        set_tests_properties(vireo_connection_close_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_connection_send_test tests/net/test_connection_send.c)
+        target_include_directories(vireo_connection_send_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_connection_send_test PRIVATE vireo_connection)
+        vireo_target_enable_warnings(vireo_connection_send_test)
+        vireo_target_enable_sanitizers(vireo_connection_send_test)
+        add_test(NAME vireo_connection_send_test COMMAND vireo_connection_send_test)
+        set_tests_properties(vireo_connection_send_test PROPERTIES TIMEOUT 30)
+    endif()
+
     if(TARGET vireo_epoll)
         add_executable(vireo_epoll_lifecycle_test tests/net/test_epoll_lifecycle.c)
         target_include_directories(vireo_epoll_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
