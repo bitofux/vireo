@@ -231,10 +231,52 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         PUBLIC vireo_result vireo_connection PRIVATE vireo_pool vireo_checked)
     vireo_target_enable_warnings(vireo_connection_pool)
     vireo_target_enable_sanitizers(vireo_connection_pool)
+
+    # acceptor：监听 fd 唯一所有权、资源生命周期与有界客户端接入
+    add_library(vireo_acceptor STATIC src/net/acceptor.c)
+    target_link_libraries(vireo_acceptor PUBLIC vireo_result vireo_event_loop)
+    vireo_target_enable_warnings(vireo_acceptor)
+    vireo_target_enable_sanitizers(vireo_acceptor)
 endif()
 
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
 if (BUILD_TESTING)
+    if(TARGET vireo_acceptor)
+        add_executable(vireo_acceptor_lifecycle_test tests/net/test_acceptor_lifecycle.c)
+        target_include_directories(vireo_acceptor_lifecycle_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_acceptor_lifecycle_test PRIVATE vireo_acceptor)
+        vireo_target_enable_warnings(vireo_acceptor_lifecycle_test)
+        vireo_target_enable_sanitizers(vireo_acceptor_lifecycle_test)
+        add_test(NAME vireo_acceptor_lifecycle_test COMMAND vireo_acceptor_lifecycle_test)
+        set_tests_properties(vireo_acceptor_lifecycle_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_acceptor_accept_test tests/net/test_acceptor_accept.c)
+        target_include_directories(vireo_acceptor_accept_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_acceptor_accept_test PRIVATE vireo_acceptor)
+        vireo_target_enable_warnings(vireo_acceptor_accept_test)
+        vireo_target_enable_sanitizers(vireo_acceptor_accept_test)
+        add_test(NAME vireo_acceptor_accept_test COMMAND vireo_acceptor_accept_test)
+        set_tests_properties(vireo_acceptor_accept_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_acceptor_loop_binding_test tests/net/test_acceptor_loop_binding.c)
+        target_include_directories(vireo_acceptor_loop_binding_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_acceptor_loop_binding_test PRIVATE vireo_acceptor)
+        vireo_target_enable_warnings(vireo_acceptor_loop_binding_test)
+        vireo_target_enable_sanitizers(vireo_acceptor_loop_binding_test)
+        add_test(NAME vireo_acceptor_loop_binding_test COMMAND vireo_acceptor_loop_binding_test)
+        set_tests_properties(vireo_acceptor_loop_binding_test PROPERTIES TIMEOUT 30)
+
+        add_executable(vireo_acceptor_integration_test tests/net/test_acceptor_integration.c)
+        target_link_libraries(vireo_acceptor_integration_test
+            PRIVATE vireo_acceptor vireo_connection_pool)
+        vireo_target_enable_warnings(vireo_acceptor_integration_test)
+        vireo_target_enable_sanitizers(vireo_acceptor_integration_test)
+        add_test(NAME vireo_acceptor_integration_test COMMAND vireo_acceptor_integration_test)
+        set_tests_properties(vireo_acceptor_integration_test PROPERTIES TIMEOUT 30)
+    endif()
     if(TARGET vireo_connection_pool)
         add_executable(vireo_connection_pool_lifecycle_test
             tests/net/test_connection_pool_lifecycle.c)
