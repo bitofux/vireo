@@ -68,6 +68,35 @@ vireo_target_enable_warnings(vireo_checked)
 # 为 vireo_checked 应用当前 sanitizer 配置
 vireo_target_enable_sanitizers(vireo_checked)
 
+# 单调采集与期限数学：公共值合同独立于 Linux/POSIX 原生类型
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(vireo_clock STATIC src/base/clock.c src/base/clock_deadline.c src/base/clock_wait.c)
+    target_link_libraries(vireo_clock PUBLIC vireo_result PRIVATE vireo_checked)
+    vireo_target_enable_warnings(vireo_clock)
+    vireo_target_enable_sanitizers(vireo_clock)
+    if(BUILD_TESTING)
+        add_executable(vireo_clock_monotonic_test tests/base/test_clock_monotonic.c)
+        target_include_directories(vireo_clock_monotonic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_clock_monotonic_test PRIVATE vireo_clock)
+        vireo_target_enable_warnings(vireo_clock_monotonic_test)
+        vireo_target_enable_sanitizers(vireo_clock_monotonic_test)
+        add_test(NAME vireo_clock_monotonic_test COMMAND vireo_clock_monotonic_test)
+        set_tests_properties(vireo_clock_monotonic_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_clock_deadline_test tests/base/test_clock_deadline.c)
+        target_link_libraries(vireo_clock_deadline_test PRIVATE vireo_clock)
+        vireo_target_enable_warnings(vireo_clock_deadline_test)
+        vireo_target_enable_sanitizers(vireo_clock_deadline_test)
+        add_test(NAME vireo_clock_deadline_test COMMAND vireo_clock_deadline_test)
+        set_tests_properties(vireo_clock_deadline_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_clock_wait_test tests/base/test_clock_wait.c)
+        target_link_libraries(vireo_clock_wait_test PRIVATE vireo_clock)
+        vireo_target_enable_warnings(vireo_clock_wait_test)
+        vireo_target_enable_sanitizers(vireo_clock_wait_test)
+        add_test(NAME vireo_clock_wait_test COMMAND vireo_clock_wait_test)
+        set_tests_properties(vireo_clock_wait_test PROPERTIES TIMEOUT 30)
+    endif()
+endif()
+
 # vireo protocol 静态库
 add_library(
     vireo_protocol
