@@ -97,6 +97,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
+# timer 数值身份及固定 owner 登记：不执行时间轮动作
+add_library(vireo_timer_handle STATIC src/timer/handle.c src/timer/handle_owner.c)
+target_link_libraries(vireo_timer_handle PUBLIC vireo_result PRIVATE vireo_checked)
+vireo_target_enable_warnings(vireo_timer_handle)
+vireo_target_enable_sanitizers(vireo_timer_handle)
+if(BUILD_TESTING)
+    add_executable(vireo_timer_handle_values_test tests/timer/test_handle_values.c)
+    target_link_libraries(vireo_timer_handle_values_test PRIVATE vireo_timer_handle)
+    vireo_target_enable_warnings(vireo_timer_handle_values_test)
+    vireo_target_enable_sanitizers(vireo_timer_handle_values_test)
+    add_test(NAME vireo_timer_handle_values_test COMMAND vireo_timer_handle_values_test)
+    set_tests_properties(vireo_timer_handle_values_test PROPERTIES TIMEOUT 30)
+    add_executable(vireo_timer_handle_owner_test tests/timer/test_handle_owner.c)
+    target_include_directories(vireo_timer_handle_owner_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_timer_handle_owner_test PRIVATE vireo_timer_handle Threads::Threads)
+    vireo_target_enable_warnings(vireo_timer_handle_owner_test)
+    vireo_target_enable_sanitizers(vireo_timer_handle_owner_test)
+    add_test(NAME vireo_timer_handle_owner_test COMMAND vireo_timer_handle_owner_test)
+    set_tests_properties(vireo_timer_handle_owner_test PROPERTIES TIMEOUT 30)
+endif()
+
 # vireo protocol 静态库
 add_library(
     vireo_protocol
