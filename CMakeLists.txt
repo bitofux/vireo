@@ -382,6 +382,105 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         PRIVATE vireo_checked vireo_tlv)
     vireo_target_enable_warnings(vireo_tcp_server)
     vireo_target_enable_sanitizers(vireo_tcp_server)
+
+    # 客户期限关联：身份、登记／取消／重排、固定记录表与显式到期关闭
+    add_library(vireo_client_deadline STATIC
+        src/net/client_deadline_binding.c src/net/client_deadline_registration.c
+        src/net/client_deadline_store.c src/net/client_deadline_rearm.c
+        src/net/client_deadline_expired_close.c src/net/client_deadline_expired_release.c
+        src/net/client_deadline_serve.c src/net/client_deadline_idle.c
+        src/net/client_deadline_request.c)
+    target_link_libraries(vireo_client_deadline
+        PUBLIC vireo_tcp_server vireo_timer_wheel vireo_timer_loop
+        PRIVATE vireo_checked)
+    vireo_target_enable_warnings(vireo_client_deadline)
+    vireo_target_enable_sanitizers(vireo_client_deadline)
+    if(BUILD_TESTING)
+        add_executable(vireo_client_deadline_binding_test tests/net/test_client_deadline_binding.c)
+        target_link_libraries(vireo_client_deadline_binding_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_binding_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_binding_test)
+        add_test(NAME vireo_client_deadline_binding_test COMMAND vireo_client_deadline_binding_test)
+        set_tests_properties(vireo_client_deadline_binding_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_registration_test tests/net/test_client_deadline_registration.c)
+        target_link_libraries(vireo_client_deadline_registration_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_registration_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_registration_test)
+        add_test(NAME vireo_client_deadline_registration_test COMMAND vireo_client_deadline_registration_test)
+        set_tests_properties(vireo_client_deadline_registration_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_store_test tests/net/test_client_deadline_store.c)
+        target_include_directories(vireo_client_deadline_store_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_client_deadline_store_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_store_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_store_test)
+        add_test(NAME vireo_client_deadline_store_test COMMAND vireo_client_deadline_store_test)
+        set_tests_properties(vireo_client_deadline_store_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_rearm_test tests/net/test_client_deadline_rearm.c)
+        target_link_libraries(vireo_client_deadline_rearm_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_rearm_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_rearm_test)
+        add_test(NAME vireo_client_deadline_rearm_test COMMAND vireo_client_deadline_rearm_test)
+        set_tests_properties(vireo_client_deadline_rearm_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_expired_close_test tests/net/test_client_deadline_expired_close.c)
+        target_include_directories(vireo_client_deadline_expired_close_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_client_deadline_expired_close_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_expired_close_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_expired_close_test)
+        add_test(NAME vireo_client_deadline_expired_close_test COMMAND vireo_client_deadline_expired_close_test)
+        set_tests_properties(vireo_client_deadline_expired_close_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_expired_release_test tests/net/test_client_deadline_expired_release.c)
+        target_include_directories(vireo_client_deadline_expired_release_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_client_deadline_expired_release_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_expired_release_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_expired_release_test)
+        add_test(NAME vireo_client_deadline_expired_release_test COMMAND vireo_client_deadline_expired_release_test)
+        set_tests_properties(vireo_client_deadline_expired_release_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_integration_test tests/net/test_client_deadline_integration.c)
+        target_link_libraries(vireo_client_deadline_integration_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_integration_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_integration_test)
+        add_test(NAME vireo_client_deadline_integration_test COMMAND vireo_client_deadline_integration_test)
+        set_tests_properties(vireo_client_deadline_integration_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_serve_test tests/net/test_client_deadline_serve.c)
+        target_include_directories(vireo_client_deadline_serve_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(vireo_client_deadline_serve_test PRIVATE vireo_client_deadline)
+        vireo_target_enable_warnings(vireo_client_deadline_serve_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_serve_test)
+        add_test(NAME vireo_client_deadline_serve_test COMMAND vireo_client_deadline_serve_test)
+        set_tests_properties(vireo_client_deadline_serve_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_idle_test tests/net/test_client_deadline_idle.c)
+        target_link_libraries(vireo_client_deadline_idle_test PRIVATE vireo_client_deadline)
+        vireo_target_enable_warnings(vireo_client_deadline_idle_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_idle_test)
+        add_test(NAME vireo_client_deadline_idle_test COMMAND vireo_client_deadline_idle_test)
+        set_tests_properties(vireo_client_deadline_idle_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_request_test tests/net/test_client_deadline_request.c)
+        target_link_libraries(vireo_client_deadline_request_test PRIVATE vireo_client_deadline)
+        vireo_target_enable_warnings(vireo_client_deadline_request_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_request_test)
+        add_test(NAME vireo_client_deadline_request_test COMMAND vireo_client_deadline_request_test)
+        set_tests_properties(vireo_client_deadline_request_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_client_deadline_request_integration_test
+            tests/net/test_client_deadline_request_integration.c)
+        target_link_libraries(vireo_client_deadline_request_integration_test
+            PRIVATE vireo_client_deadline vireo_timer_loop)
+        vireo_target_enable_warnings(vireo_client_deadline_request_integration_test)
+        vireo_target_enable_sanitizers(vireo_client_deadline_request_integration_test)
+        add_test(NAME vireo_client_deadline_request_integration_test
+            COMMAND vireo_client_deadline_request_integration_test)
+        set_tests_properties(vireo_client_deadline_request_integration_test PROPERTIES TIMEOUT 30)
+    endif()
 endif()
 
 # BUILD_TESTING 由 include(CTest) 提供，默认开启
