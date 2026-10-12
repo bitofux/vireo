@@ -471,6 +471,35 @@ target_link_libraries(
 vireo_target_enable_warnings(vireo_chunk)
 vireo_target_enable_sanitizers(vireo_chunk)
 
+# completion 独立描述与响应字节：公开值合同及受检申请预算
+add_library(vireo_completion STATIC src/thread/completion_metadata.c src/thread/completion.c)
+target_link_libraries(vireo_completion PUBLIC vireo_task vireo_result vireo_protocol PRIVATE vireo_checked)
+vireo_target_enable_warnings(vireo_completion)
+vireo_target_enable_sanitizers(vireo_completion)
+if(BUILD_TESTING)
+    add_executable(vireo_completion_metadata_test tests/thread/test_completion_metadata.c)
+    target_link_libraries(vireo_completion_metadata_test PRIVATE vireo_completion)
+    vireo_target_enable_warnings(vireo_completion_metadata_test)
+    vireo_target_enable_sanitizers(vireo_completion_metadata_test)
+    add_test(NAME vireo_completion_metadata_test COMMAND vireo_completion_metadata_test)
+    set_tests_properties(vireo_completion_metadata_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_completion_owned_output_test tests/thread/test_completion_owned_output.c)
+    target_include_directories(vireo_completion_owned_output_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vireo_completion_owned_output_test PRIVATE vireo_completion)
+    vireo_target_enable_warnings(vireo_completion_owned_output_test)
+    vireo_target_enable_sanitizers(vireo_completion_owned_output_test)
+    add_test(NAME vireo_completion_owned_output_test COMMAND vireo_completion_owned_output_test)
+    set_tests_properties(vireo_completion_owned_output_test PROPERTIES TIMEOUT 30)
+
+    add_executable(vireo_completion_integration_test tests/thread/test_completion_integration.c)
+    target_link_libraries(vireo_completion_integration_test PRIVATE vireo_completion vireo_thread_pool Threads::Threads)
+    vireo_target_enable_warnings(vireo_completion_integration_test)
+    vireo_target_enable_sanitizers(vireo_completion_integration_test)
+    add_test(NAME vireo_completion_integration_test COMMAND vireo_completion_integration_test)
+    set_tests_properties(vireo_completion_integration_test PROPERTIES TIMEOUT 30)
+endif()
+
 # 日志公共库：纯格式化、资源生命周期、同步 emit/flush 与单归档轮转
 find_package(Threads REQUIRED)
 add_library(vireo_log STATIC src/base/log.c)
