@@ -127,6 +127,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         vireo_target_enable_sanitizers(vireo_notifier_queue_cooperation_test)
         add_test(NAME vireo_notifier_queue_cooperation_test COMMAND vireo_notifier_queue_cooperation_test)
         set_tests_properties(vireo_notifier_queue_cooperation_test PROPERTIES TIMEOUT 30)
+
+        # 六组件公开链路：协作取消/期限结果、乱序身份及配对收尾
+        add_executable(vireo_async_components_integration_test tests/thread/test_async_components_integration.c)
+        target_link_libraries(vireo_async_components_integration_test PRIVATE
+            vireo_notifier vireo_completion_queue vireo_thread_pool Threads::Threads)
+        vireo_target_enable_warnings(vireo_async_components_integration_test)
+        vireo_target_enable_sanitizers(vireo_async_components_integration_test)
+        add_test(NAME vireo_async_components_integration_test COMMAND vireo_async_components_integration_test)
+        set_tests_properties(vireo_async_components_integration_test PROPERTIES TIMEOUT 30)
     endif()
 endif()
 
