@@ -59,6 +59,32 @@ vireo_result_t vireo_tcp_server_create_with_ops(vireo_tcp_server_options_t const
                                                vireo_tcp_server_t **out_server,
                                                vireo_tcp_server_error_t *error);
 
+/**
+ * @brief 本核心辅助容量创建测试 seam，复用原完整逐对象依赖表
+ *
+ * @param[in] options
+ *     原公共四项选项。
+ * @param[in] auxiliary_capacity
+ *     原新公共入口的正辅助项数。
+ * @param[in] ops
+ *     原完整本核心表，按值复制；context 借用至销毁。
+ * @param[in,out] out_server
+ *     独立入口 NULL owner。
+ * @param[out] error
+ *     原可空完整资源诊断。
+ *
+ * @return
+ *     沿新公共创建合同；表缺失/不完整 INVALID_ARGUMENT。
+ *
+ * @note
+ *     只允许本 server 的测试使用，不属于下游合同，不读取其他核心私有头。
+ *     创建/回滚/消费沿原表约束，所有路径保持入口 errno。
+ */
+vireo_result_t vireo_tcp_server_create_with_auxiliary_ops(
+    vireo_tcp_server_options_t const *options, size_t auxiliary_capacity,
+    vireo_tcp_server_ops_t const *ops, vireo_tcp_server_t **out_server,
+    vireo_tcp_server_error_t *error);
+
 /** 本层监听依赖表，完整按值复制；只调用旧模块公共 API，不拥有借用 context。
  *  inspect 不改变对象；ADD/MOD/DEL 失败保持状态；forget 仅在 loop 真实消费后调用，
  *  有效此前绑定的对象必须成功；destroy OK/IO 必须真实消费。违约不保证恢复。
@@ -174,5 +200,65 @@ vireo_result_t vireo_tcp_server_close_batch_with_gate(vireo_tcp_server_t *server
     vireo_tcp_server_close_batch_result_t *out_results, size_t result_capacity,
     vireo_tcp_server_close_batch_info_t *out_info, vireo_tcp_server_close_batch_error_t *error,
     vireo_tcp_server_close_queue_gate_t gate, void *gate_context);
+
+/** 本核心单次辅助操作seam；只调用公开loop，context仅借至该操作返回。
+ *  ADD/DEL失败须保资源与handle，inspect只读；成功须真实取得/消费登记。
+ *  不持久保存表，不授予下游私有loop/布局访问，不把模型原因当内核故障。 */
+typedef struct vireo_tcp_server_auxiliary_ops {
+    void *context;
+    vireo_result_t (*inspect)(void *, vireo_event_loop_t const *, vireo_event_loop_handle_t,
+        vireo_event_loop_registration_t *);
+    vireo_result_t (*add)(void *, vireo_event_loop_t *, vireo_event_loop_registration_t const *,
+        vireo_event_loop_handle_t *, vireo_event_loop_error_t *);
+    vireo_result_t (*del)(void *, vireo_event_loop_t *, vireo_event_loop_handle_t *,
+        vireo_event_loop_error_t *);
+} vireo_tcp_server_auxiliary_ops_t;
+
+/** 仅本核心组合实际辅助容量和公开等待seam；scheduler/context沿原寿命合同。
+ * 无下游私有头、用户回调或生产公共扩展，其他沿显式容量create。 */
+vireo_result_t vireo_tcp_server_create_with_auxiliary_scheduler_ops(
+    vireo_tcp_server_options_t const *, size_t, vireo_tcp_server_scheduler_ops_t const *,
+    vireo_tcp_server_t **, vireo_tcp_server_error_t *);
+
+/** 仅本server测试，完整表必需；其他沿公共register/errno合同。 */
+vireo_result_t vireo_tcp_server_auxiliary_read_register_with_ops(vireo_tcp_server_t *, int,
+    vireo_event_loop_handle_t *, vireo_tcp_server_auxiliary_error_t *,
+    vireo_tcp_server_auxiliary_ops_t const *);
+/** 仅本server测试，完整表必需；其他沿公共unregister/errno合同。 */
+vireo_result_t vireo_tcp_server_auxiliary_read_unregister_with_ops(vireo_tcp_server_t *,
+    vireo_event_loop_handle_t *, vireo_tcp_server_auxiliary_error_t *,
+    vireo_tcp_server_auxiliary_ops_t const *);
+
+/** 本 server 的取出前故障门，不持久保存；仅模型失败，无损坏布局或内核故障证明。
+ * gate 只观察 server/租约/已取数，不改资源，返回非 OK 时不撤销当前待办。
+ * NULL 为生产路径，成功仍执行真实 queue_remove；context 仅借到本次返回。 */
+typedef vireo_result_t (*vireo_tcp_server_poll_queue_gate_t)(void *context,
+    vireo_tcp_server_t const *server, vireo_connection_pool_lease_t client, size_t selected);
+vireo_result_t vireo_tcp_server_poll_ready_once_with_gate(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_poll_report_t *report,
+    vireo_tcp_server_poll_queue_gate_t gate, void *context);
+
+
+/**
+ * @brief
+ *     本server新监听等待变体的只读取出前故障门，未新增持久hook。
+ *
+ * @param[in] gate
+ *     可空原本核心poll gate，只观察客户/已取数，失败不撤当前待办。
+ * @param[in,out] context
+ *     可空短借上下文，稳定至返回，不保存或修改外组件私有状态。
+ *
+ * @return
+ *     公共新poll分类及真实前缀；成功wait后gate失败仍保listener事件。
+ *
+ * @note
+ *     其他参数沿新公共入口，完整表/旧依赖寿命沿原合同，保持errno。
+ *     只本server测试使用，下游不得包含此头或取得隐藏loop。
+ */
+vireo_result_t vireo_tcp_server_poll_with_listener_once_with_gate(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_listener_poll_report_t *report,
+    vireo_tcp_server_poll_queue_gate_t gate, void *context);
 
 #endif /* VIREO_NET_TCP_SERVER_INTERNAL_H */

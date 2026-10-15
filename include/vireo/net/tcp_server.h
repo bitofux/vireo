@@ -50,7 +50,7 @@ typedef struct vireo_tcp_server_admission_options {
 typedef struct vireo_tcp_server_info {
     size_t connection_capacity;
     size_t event_capacity;
-    size_t registration_capacity; /**< connection_capacity+1，内部唤醒不占客户注册槽。 */
+    size_t registration_capacity; /**< 原create为connection_capacity+1；新变体另加显式辅助容量，内部唤醒不占槽。 */
     size_t server_allocation_bytes; /**< 本层 control 与固定客户元数据，不包含依赖。 */
     size_t client_slots_bytes;      /**< server_allocation_bytes 的表子集，不另加总。 */
     size_t registered_connections; /**< 成功登记且未注销的客户数，独立于池拥有数量。 */
@@ -87,6 +87,9 @@ typedef struct vireo_tcp_server_info {
     bool auto_close_policy;        /**< 默认false的服务轮EOF/实际网络错误关闭策略。 */
     bool closing_active;           /**< 整个关闭请求批次在途，非跨线程同步。 */
     size_t close_next_slot;         /**< 独立关闭扫描游标，始终小于连接容量。 */
+    size_t auxiliary_registration_capacity; /**< 固定预留项数；旧create为0，不是活跃辅助登记数。 */
+    bool auxiliary_read_bound; /**< 本项单辅助READ源是否绑定，不表示fd当前就绪。 */
+    uint32_t auxiliary_pending_events; /**< 当前累计READ/ERROR/HANGUP；取出只清此标记，不消费fd。 */
 } vireo_tcp_server_info_t;
 
 /** 本层失败阶段；返回分类和依赖原诊断分别保留。 */
@@ -162,6 +165,47 @@ vireo_result_t vireo_tcp_server_create(vireo_tcp_server_options_t const *options
                                      vireo_tcp_server_error_t *error);
 
 /**
+ * @brief 创建空 server，并显式预留辅助 loop 注册存储
+ *
+ * @param[in] options
+ *     原四项非空正选项，仅短借；客户容量和事件批次容量各自独立。
+ * @param[in] auxiliary_capacity
+ *     正 size_t 注册项数；总注册为客户容量加一再加此值，最多 65536。
+ * @param[in,out] out_server
+ *     独立唯一 owner 地址，入口必须为 NULL，完整成功才发布。
+ * @param[out] error
+ *     可空独立原资源诊断，每路径覆盖；保留主因和首回滚错误。
+ *
+ * @retval VIREO_OK
+ *     完整取得空 server；inspect 报告固定辅助容量，没有实际辅助登记。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需 NULL、原零选项、零辅助容量或非空创建目标。
+ * @retval VIREO_RESULT_OVERFLOW
+ *     原选项硬限通过后，总注册受检相加不可表示；其余受检/身份耗尽沿原 create。
+ * @retval VIREO_RESULT_RANGE
+ *     原选项硬限、总注册上限或实际容器预算超出。
+ * @retval VIREO_RESULT_NO_MEMORY
+ *     本层/依赖申请失败，逆序回滚已取得资源。
+ * @retval VIREO_RESULT_IO
+ *     依赖系统失败，原诊断与首回滚错误分别保留。
+ * @retval VIREO_RESULT_INTERNAL
+ *     依赖公开快照不满足原创建不变量。
+ *
+ * @note
+ *     顺序为基本检查、原选项硬限、受检客户加一加辅助、总注册上限，再沿原 create
+ *     申请/观测/预算核对。失败保持 owner，所有路径保持入口 errno，不缩容或重试。
+ * @note
+ *     新增 loop 存储计原 max_memory_bytes；不增加客户池容量或客户 buffer 额度，
+ *     不新增 fd、辅助记录表或运行扩容。原 create 仍只派生客户容量加一，辅助为零。
+ * @note
+ *     全部同对象访问 Reactor-only（原 request_stop 例外）；地址/生命期/唯一拥有及
+ *     销毁前置沿原 create。此入口不暴露 loop，不登记 notifier，不冻结后续注册合同。
+ */
+vireo_result_t vireo_tcp_server_create_with_auxiliary_capacity(
+    vireo_tcp_server_options_t const *options, size_t auxiliary_capacity,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_error_t *error);
+
+/**
  * @brief 核对公开依赖快照后，完整提交容量、监听/客户状态和实际申请数
  *
  * @param[in] server
@@ -209,6 +253,129 @@ vireo_result_t vireo_tcp_server_inspect(vireo_tcp_server_t const *server,
  */
 vireo_result_t vireo_tcp_server_destroy(vireo_tcp_server_t **server,
                                       vireo_tcp_server_error_t *error);
+
+/** 辅助READ操作的独立阶段，不重排原server或loop枚举。 */
+typedef enum vireo_tcp_server_auxiliary_stage {
+    VIREO_TCP_SERVER_AUXILIARY_NONE = 0,
+    VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING = 1,
+    VIREO_TCP_SERVER_AUXILIARY_REGISTER = 2,
+    VIREO_TCP_SERVER_AUXILIARY_UNREGISTER = 3
+} vireo_tcp_server_auxiliary_stage_t;
+
+/** 数值副本，不延长fd或server生命期，不认证后来重新登记的身份。 */
+typedef struct vireo_tcp_server_auxiliary_event {
+    vireo_event_loop_handle_t handle; /**< 取出时原完整辅助登记身份；后来可成为历史值。 */
+    uint32_t events; /**< 合并READ/ERROR/HANGUP，非通知计数或完成项数。 */
+} vireo_tcp_server_auxiliary_event_t;
+
+/** 每可写路径发布的独立诊断；原loop原因未调用时逻辑零。 */
+typedef struct vireo_tcp_server_auxiliary_error {
+    vireo_tcp_server_auxiliary_stage_t stage;
+    vireo_event_loop_error_t loop_error;
+} vireo_tcp_server_auxiliary_error_t;
+
+/**
+ * @brief
+ *     把唯一辅助fd固定登记为LT READ，内部回调只累计就绪位。
+ *
+ * @param[in,out] server
+ *     存活资源根，须已显式预留至少一项；本项只允许一个辅助绑定。
+ * @param[in] fd
+ *     caller拥有的非负存活fd，0合法；借至成功注销或自有loop真实销毁。
+ * @param[out] out_handle
+ *     必需独立数值输出，入口loop_id/token均为0；完整ADD成功才发布。
+ * @param[out] error
+ *     可空独立诊断，每路径覆盖，成功/基本拒绝NONE。
+ *
+ * @retval VIREO_OK
+ *     已登记并发布完整身份，没有消费fd或执行用户回调。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需NULL、负fd或非空输出，输出与绑定保持。
+ * @retval VIREO_RESULT_NOT_FOUND
+ *     未预留辅助注册容量。
+ * @retval VIREO_RESULT_BUSY
+ *     六有限阶段在途，已有辅助绑定或原loop重复fd/满表。
+ *
+ * @return
+ *     其余公开ADD错误原样返回，含OVERFLOW/IO及原诊断。
+ *
+ * @note
+ *     顺序：基本检查、六有限在途、固定容量与单绑定资格，再一次ADD。
+ *     不借出loop、不申请/扩容、不改fd标志或close；extra>1本项仍最多一项。
+ *     fd不得在借用未结束时关闭/复用；notifier fd仅通过其公开notify/consume操作。
+ * @note
+ *     原server控制块增长按真实sizeof计原总预算，旧紧预算可需增加。
+ *     Reactor-only；有限阶段结束的run observer可用，已停止允许机械登记但不恢复分发。
+ *     独立有效对齐地址互不重叠且不位于自有资源/errno内；保持入口errno。
+ * @note
+ *     失败完整输出/绑定/累计位保持，ADD失败可消耗原发号序号，不内部重试。
+ *     内部回调只OR READ/ERROR/HANGUP；实际消费/回写由caller在安全时点处理。
+ */
+vireo_result_t vireo_tcp_server_auxiliary_read_register(vireo_tcp_server_t *server, int fd,
+    vireo_event_loop_handle_t *out_handle, vireo_tcp_server_auxiliary_error_t *error);
+
+/**
+ * @brief
+ *     只注销本辅助身份，完整DEL成功清传入handle及累计标记。
+ *
+ * @param[in,out] server
+ *     存活资源根，Reactor-only；已停止也可用。
+ * @param[in,out] handle
+ *     必需独立原完整登记身份，成功清零，其他副本随后失效。
+ * @param[out] error
+ *     可空独立诊断，每路径覆盖。
+ *
+ * @retval VIREO_OK
+ *     借用已结束、内部记录和本handle已清，不关闭fd。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     基本NULL或畸形/跨loop身份。
+ * @retval VIREO_RESULT_NOT_FOUND
+ *     空/旧身份，或不是本辅助绑定；不自动当成功，不注销客户/监听。
+ * @retval VIREO_RESULT_RANGE
+ *     公开loop核验拒绝槽范围。
+ * @retval VIREO_RESULT_BUSY
+ *     有效辅助身份在六有限阶段被修改。
+ *
+ * @return
+ *     原公开核验/DEL其他错误透传，包括IO/原原因。
+ *
+ * @note
+ *     先公开只读核验形态/域/范围，再匹配本辅助、在途检查、一次DEL。
+ *     DEL失败保完整handle/绑定/累计位/借用，不能提前销毁fd owner；无retry。
+ *     原server loop真实销毁也结束借用，未结束全部运行者时不能destroy。
+ * @note
+ *     全部地址独立有效对齐、不重叠、不位于资源/errno内；保持入口errno。
+ */
+vireo_result_t vireo_tcp_server_auxiliary_read_unregister(vireo_tcp_server_t *server,
+    vireo_event_loop_handle_t *handle, vireo_tcp_server_auxiliary_error_t *error);
+
+/**
+ * @brief
+ *     在服务轮返回或原observer安全窗口取出累计就绪，仅清C标记。
+ *
+ * @param[in,out] server
+ *     存活资源根，Reactor-only；六有限阶段BUSY，停止后的旧标记仍可取。
+ * @param[out] out_event
+ *     必需独立完整按值输出，成功可覆盖已有值，失败保持全部字节。
+ * @param[out] error
+ *     可空独立诊断，每路径覆盖。
+ *
+ * @retval VIREO_OK
+ *     发布当前辅助完整handle/非零累计位并清累计位；保持绑定/借用。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需NULL。
+ * @retval VIREO_RESULT_BUSY
+ *     六有限阶段在途。
+ * @retval VIREO_RESULT_NOT_FOUND
+ *     无辅助绑定或没有累计就绪，输出保持。
+ *
+ * @note
+ *     不读fd、不领队列、不自动消费/关闭/安排下一轮；就绪不是当前可读保证。
+ *     LT未消费数据时后续等待仍可再次标记；后来注销/重绑可令event身份成为历史值。
+ *     地址有效、对齐、独立且不重叠，不位于资源/errno内；全部路径保持errno。
+ */
+vireo_result_t vireo_tcp_server_auxiliary_read_take_ready(vireo_tcp_server_t *server,
+    vireo_tcp_server_auxiliary_event_t *out_event, vireo_tcp_server_auxiliary_error_t *error);
 
 /** 绑定诊断独立于资源诊断；返回依赖分类，并保存完整原原因。 */
 typedef enum vireo_tcp_server_listener_stage {
@@ -1912,5 +2079,136 @@ vireo_result_t vireo_tcp_server_close_batch(vireo_tcp_server_t *server,
     vireo_connection_close_mode_t mode, vireo_tcp_server_close_batch_budget_t const *budget,
     vireo_tcp_server_close_batch_result_t *out_results, size_t result_capacity,
     vireo_tcp_server_close_batch_info_t *out_info, vireo_tcp_server_close_batch_error_t *error);
+
+/** 一次机械取出的客户待办；数值快照不拥有或保活 connection。 */
+typedef struct vireo_tcp_server_ready_client {
+    vireo_connection_pool_lease_t client; /**< 当前完整存储租约；后续操作仍须核验。 */
+    uint32_t events; /**< 原 pending 的 OR；显式安排缓存工作时允许为零。 */
+} vireo_tcp_server_ready_client_t;
+
+/** 独立机械等待阶段，不改变原 round/serve/run 的枚举。 */
+typedef enum vireo_tcp_server_poll_stage {
+    VIREO_TCP_SERVER_POLL_NONE = 0,
+    VIREO_TCP_SERVER_POLL_CHECK_SERVER = 1,
+    VIREO_TCP_SERVER_POLL_WAIT = 2,
+    VIREO_TCP_SERVER_POLL_QUEUE = 3
+} vireo_tcp_server_poll_stage_t;
+
+/** 每条可写路径发布真实前缀；未调用的依赖信息逻辑零。 */
+typedef struct vireo_tcp_server_poll_report {
+    vireo_tcp_server_poll_stage_t stage; /**< 主错误阶段；成功或基本参数拒绝 NONE。 */
+    bool wait_called; /**< 本次已调用原 loop 等待，不表示等待成功。 */
+    bool stopped; /**< 入口公开观察已停止；不是跨线程停止屏障。 */
+    size_t queued_before_wait; /**< 队列核验后、等待前的去重待办数。 */
+    int effective_timeout_ms; /**< 实际计划的非负毫秒；已有待办时为零。 */
+    vireo_event_loop_run_info_t wait; /**< 原等待统计；失败/未调用时逻辑零。 */
+    size_t queued_after_wait; /**< 成功等待后的待办数，取出之前记录。 */
+    size_t selected_count; /**< out_clients 已写、已撤待办的有效前缀项数。 */
+    size_t remaining_count; /**< 队列核验后本调用返回时仍排队的项数。 */
+    vireo_event_loop_error_t loop_error; /**< 原等待诊断；未调用时逻辑零。 */
+} vireo_tcp_server_poll_report_t;
+
+/**
+ * @brief
+ *     等待一次并按 FIFO 取出有界客户待办，返回后由 caller 在安全窗口处理。
+ *
+ * @param[in,out] server
+ *     必需存活资源根；复用固定队列，不对外借出 loop 或客户 owner。
+ * @param[in] timeout_ms
+ *     非负相对毫秒上限，0 不等待、最多 INT_MAX；已有待办强制使用 0。
+ * @param[in] max_clients
+ *     显式正取出上限，1..MAX_CONNECTIONS，不默认扩大预算。
+ * @param[out] out_clients
+ *     必需独立有效数组，仅写成功取出的真实前缀，其余元素保持。
+ * @param[in] client_capacity
+ *     数组容量，1..MAX_CONNECTIONS；实际取 min(等待后 Q,上限,容量)。
+ * @param[out] report
+ *     必需独立可写报告；每条可写路径发布，失败也须查看 selected_count。
+ *
+ * @retval VIREO_OK
+ *     一次等待及取出完成；入口已停止则 stopped=true，不等待、不取出。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需 NULL、负等待或零上限/数组容量；数组及队列保持。
+ * @retval VIREO_RESULT_RANGE
+ *     上限或数组容量超过 MAX_CONNECTIONS；数组及队列保持。
+ * @retval VIREO_RESULT_BUSY
+ *     六有限阶段或整次 run 在途，含原 observer 内递归调用；资源保持。
+ * @retval VIREO_RESULT_INTERNAL
+ *     本层队列不变量异常；已取前缀保持，不修复损坏队列。
+ * @return
+ *     其余公开观察/等待错误原样返回；等待失败无本轮回调，数组和原待办保持。
+ *
+ * @note
+ *     成功取出撤销该客户 queued/pending，未取项保持；events 为零也可有缓存工作。
+ *     caller 须处理有效前缀，并在仍有待办时显式 schedule_client 排尾；不自动回队。
+ *     租约只为数值快照，不保证后续当前性，也不结束原读区借用或消费客户所有权。
+ *
+ * @note
+ *     不 accept/receive/process/submit/send/refresh/关闭/归还或消费 notifier。
+ *     listener 仅沿原历史观察，辅助源保原 pending；本报告不提供本轮 listener 事件。
+ *     数量预算只限制取出；内核通知另受原 event_capacity 约束，不保证 CPU 时间。
+ *
+ * @note
+ *     全部同 server Reactor-only，调用全程禁 POSIX 线程取消；地址独立对齐且不重叠。
+ *     一次内部等待只执行原记录通知，返回前清 scheduling_active；不新增运行申请。
+ *     入口停止观察不是同步屏障，已经开始的有限轮不抢占，沿原 loop 停止合同。
+ *     保持入口 errno，不重试、回滚或重放；已取前缀在失败时仍由 caller 处理。
+ */
+vireo_result_t vireo_tcp_server_poll_ready_once(vireo_tcp_server_t *server, int timeout_ms,
+    size_t max_clients, vireo_tcp_server_ready_client_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_poll_report_t *report);
+
+
+/** 与同一次等待配对的数值报告，不拥有客户或监听资源。 */
+typedef struct vireo_tcp_server_listener_poll_report {
+    vireo_tcp_server_poll_report_t poll; /**< 原十字段报告，含真实取出前缀/停止/原诊断。 */
+    uint32_t listener_events; /**< 仅本变体本次成功wait的监听通知OR，非历史last。 */
+} vireo_tcp_server_listener_poll_report_t;
+
+/**
+ * @brief
+ *     一次等待并取出有界客户待办，同时交出该次等待的监听通知。
+ *
+ * @param[in,out] server
+ *     必需存活网络根，原run之外Reactor串行；没有监听或未绑定也允许等待客户。
+ * @param[in] timeout_ms
+ *     原非负相对毫秒上限，已有客户待办强制0，最多INT_MAX。
+ * @param[in] max_clients
+ *     显式正size_t客户取出上限，≤MAX_CONNECTIONS。
+ * @param[out] out_clients
+ *     必需独立数组，只写原FIFO真实取出前缀，未写尾保持，不移交客户所有权。
+ * @param[in] client_capacity
+ *     正size_t≤MAX_CONNECTIONS；原取出数量=min(等待后Q,max_clients,容量)。
+ * @param[out] report
+ *     必需独立两字段报告，每可写路径覆盖，错误也须查看poll.selected_count。
+ *
+ * @retval VIREO_OK
+ *     机械等待完成；入口已停止仍OK、stopped=true，不wait/取出且事件0。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需NULL/负等待/零数量，客户数组及队列保持。
+ * @retval VIREO_RESULT_RANGE
+ *     数量超限，客户数组及队列保持。
+ * @retval VIREO_RESULT_BUSY
+ *     原六有限阶段或running在途，含原observer内递归调用。
+ * @return
+ *     其余原poll观察/等待/队列错误原样返回，保原阶段及诊断，无新错误枚举。
+ *
+ * @note
+ *     仅本次实际wait窗口采集监听通知OR；未wait或等待失败事件为0。
+ *     成功wait后即使客户取出失败仍保本轮事件及已取前缀，caller先处理主失败/客户恢复。
+ *     采集在wait返回时结束，不跨轮累计，不因交出本报告清历史listener_last_events。
+ * @note
+ *     ERROR/HANGUP仅报告原位，不自动把机械等待结果改为IO或猜errno。
+ *     caller在返回安全窗口优先处理异常；仅本轮READ才最多一次原有界033-04接入尝试。
+ *     READ不保证accept成功/预留额度，EAGAIN及资源限额沿原合同；不自动admit或驱动客户。
+ * @note
+ *     原poll/async_round/同步serve行为保持，辅助通知仍独立pending；不借出loop或fd。
+ *     全调用禁POSIX取消，同serverReactor串行，地址有效独立对齐不重叠。
+ *     报告按值不保活或认证当前内核就绪，晚stop沿原loop合同，不恢复永久停止。
+ *     固定采集状态计原control预算，无运行申请/扩容/重试/回滚，保持入口errno。
+ */
+vireo_result_t vireo_tcp_server_poll_with_listener_once(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_listener_poll_report_t *report);
 
 #endif /* VIREO_NET_TCP_SERVER_H */

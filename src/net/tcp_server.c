@@ -47,6 +47,8 @@ struct vireo_tcp_server {
     bool listener_bound;
     bool listener_read_enabled;
     uint32_t listener_last_events;
+    bool listener_poll_active; /**< 仅新poll实际wait窗口，非跨线程状态。 */
+    uint32_t listener_poll_events; /**< 本窗口OR，wait结束即取值并清零。 */
     vireo_tcp_server_client_ops_t client_ops;
     size_t server_bytes;
     size_t client_slots_bytes;
@@ -74,6 +76,9 @@ struct vireo_tcp_server {
     size_t admission_pair_bytes; /**< 两固定容量checked和，启用时正。 */
     uint32_t serve_listener_events; /**< 仅本serve wait期间通知OR，非历史快照。 */
     bool queue_fault; /**< void 通知适配器的异常转交本轮，健康合同下恒 false。 */
+    vireo_event_loop_handle_t auxiliary_handle; /**< 唯一辅助登记身份，未绑定全零。 */
+    int auxiliary_fd; /**< 借用fd，未绑定−1；不由server关闭。 */
+    uint32_t auxiliary_pending_events; /**< 内部回调OR，安全窗口取出或成功DEL清零。 */
     client_slot_t clients[]; /**< 随 control 单次固定申请，槽地址至 destroy 保持。 */
 };
 
@@ -357,6 +362,7 @@ static void listener_observed(vireo_acceptor_t *acceptor, uint32_t events, void 
     vireo_tcp_server_t *server = context;
     server->listener_last_events = events;
     if (server->serving_active) server->serve_listener_events |= events;
+    if (server->listener_poll_active) server->listener_poll_events |= events;
 }
 
 /** public acceptor 的固定申请必须为正且在自身预算内。 */
@@ -723,6 +729,7 @@ static void rollback(vireo_tcp_server_t *server, vireo_tcp_server_error_t *error
 }
 
 static vireo_result_t create_with_dependencies(vireo_tcp_server_options_t const *options,
+                                               size_t auxiliary_capacity,
                                                vireo_tcp_server_ops_t const *ops,
                                                vireo_tcp_server_listener_ops_t const *listener_ops,
                                                vireo_tcp_server_client_ops_t const *client_ops,
@@ -747,6 +754,8 @@ static vireo_result_t create_with_dependencies(vireo_tcp_server_options_t const 
     }
     size_t registrations = 0;
     vireo_result_t result = vireo_checked_size_add(options->connection_capacity, 1, &registrations);
+    if (result == VIREO_OK)
+        result = vireo_checked_size_add(registrations, auxiliary_capacity, &registrations);
     if (result != VIREO_OK) return finish(result, &detail, error, saved_errno);
     if (registrations > VIREO_EVENT_LOOP_MAX_REGISTRATIONS) {
         return finish(VIREO_RESULT_RANGE, &detail, error, saved_errno);
@@ -765,6 +774,7 @@ static vireo_result_t create_with_dependencies(vireo_tcp_server_options_t const 
     *server = (vireo_tcp_server_t){.options = *options, .ops = *ops, .listener_ops = *listener_ops,
         .client_ops = *client_ops, .scheduler_ops = *scheduler_ops, .stop_ops = *stop_ops,
         .queue_head = SIZE_MAX, .queue_tail = SIZE_MAX, .auto_release_ready = false, .auto_close_policy = false,
+        .auxiliary_fd = -1,
         .server_bytes = server_bytes, .client_slots_bytes = slots_bytes};
     for (size_t i = 0; i < options->connection_capacity; ++i) server->clients[i] = (client_slot_t){.parent = server, .queue_prev = SIZE_MAX, .queue_next = SIZE_MAX};
     vireo_event_loop_options_t const loop_options = {
@@ -817,7 +827,7 @@ vireo_result_t vireo_tcp_server_create_with_all_ops(vireo_tcp_server_options_t c
     vireo_tcp_server_ops_t const *ops, vireo_tcp_server_listener_ops_t const *listener_ops,
     vireo_tcp_server_t **out_server, vireo_tcp_server_error_t *error)
 {
-    return create_with_dependencies(options, ops, listener_ops, &system_client_ops, &system_scheduler_ops, &system_stop_ops, out_server, error);
+    return create_with_dependencies(options, 0, ops, listener_ops, &system_client_ops, &system_scheduler_ops, &system_stop_ops, out_server, error);
 }
 
 vireo_result_t vireo_tcp_server_create_with_client_ops(vireo_tcp_server_options_t const *options,
@@ -825,7 +835,7 @@ vireo_result_t vireo_tcp_server_create_with_client_ops(vireo_tcp_server_options_
     vireo_tcp_server_client_ops_t const *client_ops, vireo_tcp_server_t **out_server,
     vireo_tcp_server_error_t *error)
 {
-    return create_with_dependencies(options, ops != NULL ? ops : &system_ops,
+    return create_with_dependencies(options, 0, ops != NULL ? ops : &system_ops,
         listener_ops != NULL ? listener_ops : &system_listener_ops, client_ops, &system_scheduler_ops, &system_stop_ops, out_server, error);
 }
 
@@ -835,7 +845,7 @@ vireo_result_t vireo_tcp_server_create_with_scheduler_ops(vireo_tcp_server_optio
     vireo_tcp_server_scheduler_ops_t const *scheduler_ops, vireo_tcp_server_t **out_server,
     vireo_tcp_server_error_t *error)
 {
-    return create_with_dependencies(options, ops != NULL ? ops : &system_ops,
+    return create_with_dependencies(options, 0, ops != NULL ? ops : &system_ops,
         listener_ops != NULL ? listener_ops : &system_listener_ops,
         client_ops != NULL ? client_ops : &system_client_ops, scheduler_ops, &system_stop_ops, out_server, error);
 }
@@ -847,7 +857,7 @@ vireo_result_t vireo_tcp_server_create_with_run_ops(vireo_tcp_server_options_t c
     vireo_tcp_server_stop_ops_t const *stop_ops, vireo_tcp_server_t **out_server,
     vireo_tcp_server_error_t *error)
 {
-    return create_with_dependencies(options, ops != NULL ? ops : &system_ops,
+    return create_with_dependencies(options, 0, ops != NULL ? ops : &system_ops,
         listener_ops != NULL ? listener_ops : &system_listener_ops,
         client_ops != NULL ? client_ops : &system_client_ops, scheduler_ops, stop_ops, out_server, error);
 }
@@ -868,6 +878,42 @@ vireo_result_t vireo_tcp_server_create(vireo_tcp_server_options_t const *options
     return vireo_tcp_server_create_with_ops(options, &system_ops, out_server, error);
 }
 
+/** 仅本核心测试使用原公开依赖表；额外容量不授予依赖布局访问权。 */
+vireo_result_t vireo_tcp_server_create_with_auxiliary_ops(
+    vireo_tcp_server_options_t const *options, size_t auxiliary_capacity,
+    vireo_tcp_server_ops_t const *ops, vireo_tcp_server_t **out_server,
+    vireo_tcp_server_error_t *error)
+{
+    int const saved_errno = errno;
+    vireo_tcp_server_error_t const detail = {0};
+    if (auxiliary_capacity == 0)
+        return finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
+    return create_with_dependencies(options, auxiliary_capacity, ops, &system_listener_ops,
+        &system_client_ops, &system_scheduler_ops, &system_stop_ops, out_server, error);
+}
+
+/** 仅本核心组合seam，容量仍受检，完整scheduler/context沿原公开桥接寿命。 */
+vireo_result_t vireo_tcp_server_create_with_auxiliary_scheduler_ops(
+    vireo_tcp_server_options_t const *options, size_t auxiliary_capacity,
+    vireo_tcp_server_scheduler_ops_t const *scheduler_ops, vireo_tcp_server_t **out_server,
+    vireo_tcp_server_error_t *error)
+{
+    int const saved_errno = errno;
+    vireo_tcp_server_error_t const detail = {0};
+    if (auxiliary_capacity == 0)
+        return finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
+    return create_with_dependencies(options, auxiliary_capacity, &system_ops, &system_listener_ops,
+        &system_client_ops, scheduler_ops, &system_stop_ops, out_server, error);
+}
+
+vireo_result_t vireo_tcp_server_create_with_auxiliary_capacity(
+    vireo_tcp_server_options_t const *options, size_t auxiliary_capacity,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_error_t *error)
+{
+    return vireo_tcp_server_create_with_auxiliary_ops(options, auxiliary_capacity,
+        &system_ops, out_server, error);
+}
+
 vireo_result_t vireo_tcp_server_inspect(vireo_tcp_server_t const *server,
                                       vireo_tcp_server_info_t *out_info)
 {
@@ -884,10 +930,25 @@ vireo_result_t vireo_tcp_server_inspect(vireo_tcp_server_t const *server,
         server->options.event_capacity, server->loop_origin.max_memory_bytes,
         server->loop_origin.registration_capacity
     };
+    size_t base_registrations = 0;
+    if (vireo_checked_size_add(server->options.connection_capacity, 1,
+                               &base_registrations) != VIREO_OK ||
+        server->loop_origin.registration_capacity < base_registrations)
+        return finish(VIREO_RESULT_INTERNAL, &unused, NULL, saved_errno);
+    size_t const auxiliary_capacity = server->loop_origin.registration_capacity - base_registrations;
+    bool const auxiliary_bound = server->auxiliary_handle.token != 0;
+    uint32_t const auxiliary_mask = VIREO_EPOLL_EVENT_READ | VIREO_EPOLL_EVENT_ERROR | VIREO_EPOLL_EVENT_HANGUP;
+    if ((server->auxiliary_handle.loop_id != 0) != auxiliary_bound ||
+        (server->auxiliary_pending_events & ~auxiliary_mask) != 0 ||
+        (auxiliary_bound && (auxiliary_capacity == 0 || server->auxiliary_fd < 0 ||
+            server->auxiliary_handle.loop_id != server->loop_origin.loop_id)) ||
+        (!auxiliary_bound && (server->auxiliary_fd != -1 || server->auxiliary_pending_events != 0)))
+        return finish(VIREO_RESULT_INTERNAL, &unused, NULL, saved_errno);
     size_t registered = 0;
     if (server->registered_clients > server->client_count ||
         vireo_checked_size_add(server->registered_clients, server->listener_bound ? 1 : 0,
                                 &registered) != VIREO_OK ||
+        vireo_checked_size_add(registered, auxiliary_bound ? 1 : 0, &registered) != VIREO_OK ||
         !loop_valid(&loop_info, &loop_options, registered) ||
         loop_info.loop_id != server->loop_origin.loop_id ||
         loop_info.loop_allocation_bytes != server->loop_origin.loop_allocation_bytes ||
@@ -964,7 +1025,10 @@ vireo_result_t vireo_tcp_server_inspect(vireo_tcp_server_t const *server,
         .admission_connection_limited = server->admission_enabled && server->client_count == server->options.connection_capacity,
         .admission_buffer_limited = server->admission_enabled && server->admission_pair_bytes > server->options.max_buffer_bytes - server->buffer_bytes,
         .admission_read_desired = server->admission_enabled && server->client_count < server->options.connection_capacity &&
-            server->admission_pair_bytes <= server->options.max_buffer_bytes - server->buffer_bytes
+            server->admission_pair_bytes <= server->options.max_buffer_bytes - server->buffer_bytes,
+        .auxiliary_registration_capacity = auxiliary_capacity,
+        .auxiliary_read_bound = auxiliary_bound,
+        .auxiliary_pending_events = server->auxiliary_pending_events
     };
     return finish(VIREO_OK, &unused, NULL, saved_errno);
 }
@@ -1030,6 +1094,176 @@ vireo_result_t vireo_tcp_server_destroy(vireo_tcp_server_t **server,
     owner->ops.deallocate(owner->ops.context, owner);
     *server = NULL;
     return finish(result, &detail, error, saved_errno);
+}
+
+/** 同Reactor六有限阶段保护；整run的observer安全窗口不在这些阶段中。 */
+static bool auxiliary_active(vireo_tcp_server_t const *s)
+{
+    return s->closing_active || s->shutdown_active || s->processing_active || s->driving_active ||
+        s->scheduling_active || s->serving_active;
+}
+
+/** 独立原因覆盖与errno保持；基本拒绝/成功为NONE，不处理fd或回滚登记。 */
+static vireo_result_t auxiliary_finish(vireo_result_t result,
+    vireo_tcp_server_auxiliary_stage_t stage, vireo_event_loop_error_t loop_error,
+    vireo_tcp_server_auxiliary_error_t *error, int saved_errno)
+{
+    if (error != NULL) *error = (vireo_tcp_server_auxiliary_error_t){
+        result == VIREO_OK ? VIREO_TCP_SERVER_AUXILIARY_NONE : stage, loop_error};
+    errno = saved_errno;
+    return result;
+}
+
+/**
+ * @brief
+ *     自有loop的固定内部辅助回调，O(1)合并当前身份的原就绪位。
+ *
+ * @param[in] loop
+ *     借用自有loop，不保存或对外暴露。
+ * @param[in] handle
+ *     当前完整登记身份，仅字段相等核对，不解码token。
+ * @param[in] fd
+ *     原登记借用fd，0合法。
+ * @param[in] events
+ *     公开过滤后的READ/ERROR/HANGUP。
+ * @param[in,out] context
+ *     存活server，登记借用由自有loop/控制块寿命保证。
+ *
+ * @note
+ *     只OR数值，不消费fd、调用用户函数、分配、阻塞或解除在途保护。
+ */
+static void auxiliary_ready(vireo_event_loop_t *loop, vireo_event_loop_handle_t handle,
+    int fd, uint32_t events, void *context)
+{
+    vireo_tcp_server_t *s = context;
+    if (s->loop == loop && s->auxiliary_handle.loop_id == handle.loop_id &&
+        s->auxiliary_handle.token == handle.token && s->auxiliary_fd == fd)
+        s->auxiliary_pending_events |= events;
+}
+
+static vireo_result_t auxiliary_inspect_public(void *context, vireo_event_loop_t const *loop,
+    vireo_event_loop_handle_t handle, vireo_event_loop_registration_t *registration)
+{
+    (void)context;
+    return vireo_event_loop_registration_inspect(loop, handle, registration);
+}
+static vireo_result_t auxiliary_add_public(void *context, vireo_event_loop_t *loop,
+    vireo_event_loop_registration_t const *registration, vireo_event_loop_handle_t *handle,
+    vireo_event_loop_error_t *error)
+{
+    (void)context;
+    return vireo_event_loop_add(loop, registration, handle, error);
+}
+static vireo_result_t auxiliary_del_public(void *context, vireo_event_loop_t *loop,
+    vireo_event_loop_handle_t *handle, vireo_event_loop_error_t *error)
+{
+    (void)context;
+    return vireo_event_loop_del(loop, handle, error);
+}
+static vireo_tcp_server_auxiliary_ops_t const auxiliary_system_ops = {
+    NULL, auxiliary_inspect_public, auxiliary_add_public, auxiliary_del_public};
+
+static bool auxiliary_ops_valid(vireo_tcp_server_auxiliary_ops_t const *ops)
+{
+    return ops != NULL && ops->inspect != NULL && ops->add != NULL && ops->del != NULL;
+}
+
+vireo_result_t vireo_tcp_server_auxiliary_read_register_with_ops(vireo_tcp_server_t *s, int fd,
+    vireo_event_loop_handle_t *out, vireo_tcp_server_auxiliary_error_t *error,
+    vireo_tcp_server_auxiliary_ops_t const *ops)
+{
+    int const saved_errno = errno;
+    vireo_event_loop_error_t detail = {0};
+    if (s == NULL || fd < 0 || out == NULL || !auxiliary_ops_valid(ops) ||
+        out->loop_id != 0 || out->token != 0)
+        return auxiliary_finish(VIREO_RESULT_INVALID_ARGUMENT, VIREO_TCP_SERVER_AUXILIARY_NONE,
+            detail, error, saved_errno);
+    if (auxiliary_active(s))
+        return auxiliary_finish(VIREO_RESULT_BUSY, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    size_t base = 0;
+    if (vireo_checked_size_add(s->options.connection_capacity, 1, &base) != VIREO_OK ||
+        s->loop_origin.registration_capacity < base)
+        return auxiliary_finish(VIREO_RESULT_INTERNAL, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    if (s->loop_origin.registration_capacity == base)
+        return auxiliary_finish(VIREO_RESULT_NOT_FOUND, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    if (s->auxiliary_handle.token != 0)
+        return auxiliary_finish(VIREO_RESULT_BUSY, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    vireo_event_loop_registration_t const registration = {
+        fd, VIREO_EPOLL_INTEREST_READ, auxiliary_ready, s};
+    vireo_event_loop_handle_t handle = {0};
+    vireo_result_t const result = ops->add(ops->context, s->loop, &registration, &handle, &detail);
+    if (result == VIREO_OK) {
+        s->auxiliary_handle = handle;
+        s->auxiliary_fd = fd;
+        s->auxiliary_pending_events = 0;
+        *out = handle;
+    }
+    return auxiliary_finish(result, VIREO_TCP_SERVER_AUXILIARY_REGISTER, detail, error, saved_errno);
+}
+
+vireo_result_t vireo_tcp_server_auxiliary_read_unregister_with_ops(vireo_tcp_server_t *s,
+    vireo_event_loop_handle_t *handle, vireo_tcp_server_auxiliary_error_t *error,
+    vireo_tcp_server_auxiliary_ops_t const *ops)
+{
+    int const saved_errno = errno;
+    vireo_event_loop_error_t detail = {0};
+    if (s == NULL || handle == NULL || !auxiliary_ops_valid(ops))
+        return auxiliary_finish(VIREO_RESULT_INVALID_ARGUMENT, VIREO_TCP_SERVER_AUXILIARY_NONE,
+            detail, error, saved_errno);
+    vireo_event_loop_registration_t registration = {0};
+    vireo_result_t result = ops->inspect(ops->context, s->loop, *handle, &registration);
+    if (result != VIREO_OK)
+        return auxiliary_finish(result, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING, detail, error, saved_errno);
+    if (handle->loop_id != s->auxiliary_handle.loop_id || handle->token != s->auxiliary_handle.token)
+        return auxiliary_finish(VIREO_RESULT_NOT_FOUND, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    if (auxiliary_active(s))
+        return auxiliary_finish(VIREO_RESULT_BUSY, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    vireo_event_loop_handle_t local = *handle;
+    result = ops->del(ops->context, s->loop, &local, &detail);
+    if (result == VIREO_OK) {
+        s->auxiliary_handle = (vireo_event_loop_handle_t){0};
+        s->auxiliary_fd = -1;
+        s->auxiliary_pending_events = 0;
+        *handle = (vireo_event_loop_handle_t){0};
+    }
+    return auxiliary_finish(result, VIREO_TCP_SERVER_AUXILIARY_UNREGISTER, detail, error, saved_errno);
+}
+
+vireo_result_t vireo_tcp_server_auxiliary_read_register(vireo_tcp_server_t *s, int fd,
+    vireo_event_loop_handle_t *out, vireo_tcp_server_auxiliary_error_t *error)
+{
+    return vireo_tcp_server_auxiliary_read_register_with_ops(s, fd, out, error, &auxiliary_system_ops);
+}
+
+vireo_result_t vireo_tcp_server_auxiliary_read_unregister(vireo_tcp_server_t *s,
+    vireo_event_loop_handle_t *handle, vireo_tcp_server_auxiliary_error_t *error)
+{
+    return vireo_tcp_server_auxiliary_read_unregister_with_ops(s, handle, error, &auxiliary_system_ops);
+}
+
+vireo_result_t vireo_tcp_server_auxiliary_read_take_ready(vireo_tcp_server_t *s,
+    vireo_tcp_server_auxiliary_event_t *out, vireo_tcp_server_auxiliary_error_t *error)
+{
+    int const saved_errno = errno;
+    vireo_event_loop_error_t const detail = {0};
+    if (s == NULL || out == NULL)
+        return auxiliary_finish(VIREO_RESULT_INVALID_ARGUMENT, VIREO_TCP_SERVER_AUXILIARY_NONE,
+            detail, error, saved_errno);
+    if (auxiliary_active(s))
+        return auxiliary_finish(VIREO_RESULT_BUSY, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    if (s->auxiliary_handle.token == 0 || s->auxiliary_pending_events == 0)
+        return auxiliary_finish(VIREO_RESULT_NOT_FOUND, VIREO_TCP_SERVER_AUXILIARY_CHECK_BINDING,
+            detail, error, saved_errno);
+    *out = (vireo_tcp_server_auxiliary_event_t){s->auxiliary_handle, s->auxiliary_pending_events};
+    s->auxiliary_pending_events = 0;
+    return auxiliary_finish(VIREO_OK, VIREO_TCP_SERVER_AUXILIARY_NONE, detail, error, saved_errno);
 }
 
 vireo_result_t vireo_tcp_server_adopt_listener(vireo_tcp_server_t *server,
@@ -3097,4 +3331,154 @@ vireo_result_t vireo_tcp_server_close_batch(vireo_tcp_server_t *server,
 {
     return vireo_tcp_server_close_batch_with_gate(server, mode, budget, out_results,
         result_capacity, out_info, error, NULL, NULL);
+}
+
+/**
+ * @brief
+ *     公共机械等待及本核心取出前故障门的共同实现。
+ *
+ * @param[in,out] server
+ *     沿公开 poll 合同，持有原固定队列及 scheduling_active。
+ * @param[in] timeout_ms
+ *     非负毫秒上限；已排队使用 0。
+ * @param[in] max_clients
+ *     本次正取出上限。
+ * @param[out] out_clients
+ *     仅写真实已移走前缀。
+ * @param[in] client_capacity
+ *     独立数组的正容量。
+ * @param[out] report
+ *     必需独立报告，每可写路径发布。
+ * @param[in] gate
+ *     可空本核心测试门，只读观察，不改变队列/资源。
+ * @param[in,out] context
+ *     gate 的可空短借用 context，不保存。
+ * @param[out] listener_events
+ *     可空独立局部事件值；NULL关闭新采集，非空仅成功wait后发布本次OR。
+ *
+ * @return
+ *     原 poll 分类；失败保留真实取出前缀和未取队列。
+ *
+ * @note
+ *     无申请或用户业务回调；全部受控出口恢复 errno，等待阶段统一清在途标记。
+ */
+static vireo_result_t poll_ready(vireo_tcp_server_t *server, int timeout_ms,
+    size_t max_clients, vireo_tcp_server_ready_client_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_poll_report_t *report, vireo_tcp_server_poll_queue_gate_t gate, void *context,
+    uint32_t *listener_events)
+{
+    int const saved = errno;
+    vireo_tcp_server_poll_report_t progress = {0};
+    if (listener_events != NULL) *listener_events = 0;
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_clients == NULL || report == NULL || timeout_ms < 0 ||
+        max_clients == 0 || client_capacity == 0) goto finish;
+    if (max_clients > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        client_capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS) {
+        result = VIREO_RESULT_RANGE;
+        goto finish;
+    }
+    progress.stage = VIREO_TCP_SERVER_POLL_CHECK_SERVER;
+    if (server->closing_active || server->shutdown_active || server->processing_active ||
+        server->driving_active || server->scheduling_active || server->serving_active ||
+        server->running_active) {
+        result = VIREO_RESULT_BUSY;
+        goto finish;
+    }
+    progress.stage = VIREO_TCP_SERVER_POLL_QUEUE;
+    if (!queue_valid(server)) {
+        result = VIREO_RESULT_INTERNAL;
+        goto finish;
+    }
+    progress.queued_before_wait = server->queue_count;
+    progress.remaining_count = server->queue_count;
+    progress.stage = VIREO_TCP_SERVER_POLL_CHECK_SERVER;
+    result = stop_snapshot(server, &progress.stopped);
+    if (result != VIREO_OK || progress.stopped) goto finish;
+    progress.effective_timeout_ms = server->queue_count != 0 ? 0 : timeout_ms;
+    server->scheduling_active = true;
+    server->queue_fault = false;
+    progress.stage = VIREO_TCP_SERVER_POLL_WAIT;
+    progress.wait_called = true;
+    if (listener_events != NULL) {
+        server->listener_poll_events = 0;
+        server->listener_poll_active = true;
+    }
+    result = server->scheduler_ops.run_once(server->scheduler_ops.context, server->loop,
+        progress.effective_timeout_ms, &progress.wait, &progress.loop_error);
+    if (listener_events != NULL) {
+        server->listener_poll_active = false;
+        if (result == VIREO_OK) *listener_events = server->listener_poll_events;
+        server->listener_poll_events = 0;
+    }
+    if (result != VIREO_OK) goto waited;
+    progress.queued_after_wait = server->queue_count;
+    progress.stage = VIREO_TCP_SERVER_POLL_QUEUE;
+    if (server->queue_fault || !queue_valid(server)) {
+        result = VIREO_RESULT_INTERNAL;
+        goto waited;
+    }
+    size_t count = progress.queued_after_wait;
+    if (count > max_clients) count = max_clients;
+    if (count > client_capacity) count = client_capacity;
+    for (size_t k = 0; k < count; ++k) {
+        size_t const index = server->queue_head;
+        if (index >= server->options.connection_capacity) {
+            result = VIREO_RESULT_INTERNAL;
+            break;
+        }
+        client_slot_t const *slot = &server->clients[index];
+        vireo_tcp_server_ready_client_t const item = {slot->lease, slot->pending_events};
+        if (gate != NULL) {
+            result = gate(context, server, item.client, progress.selected_count);
+            if (result != VIREO_OK) break;
+        }
+        result = queue_remove(server, index);
+        if (result != VIREO_OK) break;
+        out_clients[progress.selected_count++] = item;
+    }
+waited:
+    progress.remaining_count = server->queue_count;
+    server->scheduling_active = false;
+finish:
+    if (result == VIREO_OK) progress.stage = VIREO_TCP_SERVER_POLL_NONE;
+    if (report != NULL) *report = progress;
+    errno = saved;
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_poll_ready_once(vireo_tcp_server_t *server, int timeout_ms,
+    size_t max_clients, vireo_tcp_server_ready_client_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_poll_report_t *report)
+{
+    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, NULL, NULL, NULL);
+}
+
+vireo_result_t vireo_tcp_server_poll_ready_once_with_gate(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_poll_report_t *report,
+    vireo_tcp_server_poll_queue_gate_t gate, void *context)
+{
+    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, gate, context, NULL);
+}
+
+/** 两字段局部报告独立于资源，NULL report仍走原基本拒绝，无窗口变更。 */
+vireo_result_t vireo_tcp_server_poll_with_listener_once_with_gate(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_listener_poll_report_t *report,
+    vireo_tcp_server_poll_queue_gate_t gate, void *context)
+{
+    vireo_tcp_server_listener_poll_report_t value = {0};
+    vireo_result_t const result = poll_ready(server, timeout_ms, max_clients, out_clients,
+        client_capacity, report != NULL ? &value.poll : NULL, gate, context, &value.listener_events);
+    if (report != NULL) *report = value;
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_poll_with_listener_once(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t client_capacity, vireo_tcp_server_listener_poll_report_t *report)
+{
+    return vireo_tcp_server_poll_with_listener_once_with_gate(server, timeout_ms,
+        max_clients, out_clients, client_capacity, report, NULL, NULL);
 }
