@@ -61,6 +61,20 @@ vireo_result_t vireo_connection_create_with_ops(vireo_connection_options_t const
                                                 vireo_connection_error_t *error);
 
 /**
+ * @brief TLS组合自己的资源失败测试缝，TLS始终经公开创建接口
+ * @param[in] context/tls_options 公共TLS构造短借合同。
+ * @param[in,out] fd_owner/out_connection 公共成功交接、失败保持合同。
+ * @param[in] ops 完整表按值复制，context借到destroy；不将recv/send用于TLS。
+ * @param[out] error 可空完整诊断。
+ * @return 公共TLS构造结果；不完整表INVALID_ARGUMENT。
+ * @note 只供own模块测试分配失败/唯一close，不暴露TLS私有布局或产品插件。
+ */
+vireo_result_t vireo_connection_create_tls_server_with_ops(vireo_tls_context_t const *context,
+    vireo_tls_connection_options_t const *tls_options, int *fd_owner,
+    vireo_connection_ops_t const *ops, vireo_connection_t **out_connection,
+    vireo_connection_error_t *error);
+
+/**
  * 仅本模块绑定测试的逐对象依赖表，遵守公开 loop 的成功发布/失败保持合同。
  * 函数完整且非空，context 借用至 connection 销毁；不引用 loop 私有布局或 backend。
  * 与资源/I/O seam 分离，旧测试及公开构造固定使用公共 loop 默认函数。

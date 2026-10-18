@@ -24,6 +24,7 @@
 
 struct vireo_connection {
     int owned_fd;
+    vireo_tls_connection_t *owned_tls; /* 唯一owner；RAW为NULL，与raw双buffer互斥。 */
     vireo_buffer_t *read_buffer;
     vireo_buffer_t *write_buffer;
     size_t buffer_capacity_bytes;
@@ -273,7 +274,7 @@ static vireo_result_t finish(vireo_connection_error_t *error, vireo_result_t res
                              vireo_connection_stage_t stage, int cause, int saved_errno)
 {
     if (error != NULL) {
-        *error = (vireo_connection_error_t){stage, cause};
+        *error = (vireo_connection_error_t){.stage = stage, .system_errno = cause};
     }
     errno = saved_errno;
     return result;
@@ -290,6 +291,9 @@ static vireo_result_t finish(vireo_connection_error_t *error, vireo_result_t res
 static void release_memory(vireo_connection_t *connection)
 {
     vireo_connection_ops_t ops = connection->ops;
+    if (connection->owned_tls != NULL) {
+        (void)vireo_tls_connection_destroy(&connection->owned_tls, NULL);
+    }
     if (connection->write_buffer != NULL) {
         ops.destroy_buffer(ops.context, &connection->write_buffer);
     }
@@ -380,6 +384,85 @@ static vireo_connection_loop_ops_t const system_loop_ops = {
     NULL, system_loop_add, system_loop_mod, system_loop_del
 };
 
+/**
+ * @brief 验证own资源表完整性；TLS不会把recv/send hook当作transport
+ * @param[in] ops 调用期短借的表，可空。
+ * @return 仅完整表为true；不访问context或执行回调。
+ */
+static bool resource_ops_valid(vireo_connection_ops_t const *ops)
+{
+    return ops != NULL && ops->allocate != NULL && ops->deallocate != NULL &&
+        ops->get_flags != NULL && ops->socket_type != NULL && ops->peer_connected != NULL &&
+        ops->close_fd != NULL && ops->create_buffer != NULL && ops->destroy_buffer != NULL &&
+        ops->receive != NULL && ops->send_bytes != NULL;
+}
+
+/**
+ * @brief 发布TLS委托分类与完整诊断，不按结果码猜系统原因
+ * @param[out] error 可空独立诊断；非OK复制dependency，成功全零。
+ * @param[in] result/dependency 已完成TLS调用的结果/有效局部诊断。
+ * @param[in] saved_errno 最外层入口值。
+ * @return result原值；不访问资源或回滚进度，恢复errno。
+ */
+static vireo_result_t tls_finish(vireo_connection_error_t *error, vireo_result_t result,
+    vireo_tls_connection_error_t const *dependency, int saved_errno)
+{
+    (void)finish(error, result, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    if (error != NULL && result != VIREO_OK) {
+        error->stage = VIREO_CONNECTION_STAGE_TLS;
+        error->system_errno = dependency->system_errno;
+        error->tls_error = *dependency;
+    }
+    return result;
+}
+
+vireo_result_t vireo_connection_create_tls_server_with_ops(vireo_tls_context_t const *context,
+    vireo_tls_connection_options_t const *tls_options, int *fd_owner,
+    vireo_connection_ops_t const *ops, vireo_connection_t **out_connection,
+    vireo_connection_error_t *error)
+{
+    int saved_errno = errno;
+    if (context == NULL || tls_options == NULL || fd_owner == NULL || out_connection == NULL ||
+        *fd_owner < 0 || *out_connection != NULL || !resource_ops_valid(ops)) {
+        return finish(error, VIREO_RESULT_INVALID_ARGUMENT,
+            VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    }
+    vireo_connection_t *candidate = ops->allocate(ops->context, sizeof(*candidate));
+    if (candidate == NULL) {
+        return finish(error, VIREO_RESULT_NO_MEMORY,
+            VIREO_CONNECTION_STAGE_ALLOCATE_CONTROL, 0, saved_errno);
+    }
+    *candidate = (vireo_connection_t){.owned_fd = -1, .ops = *ops, .loop_ops = system_loop_ops};
+    vireo_tls_connection_error_t dependency = {0};
+    vireo_result_t result = vireo_tls_connection_create_server(context, tls_options, *fd_owner,
+        &candidate->owned_tls, &dependency);
+    if (result != VIREO_OK) {
+        release_memory(candidate);
+        return tls_finish(error, result, &dependency, saved_errno);
+    }
+    candidate->owned_fd = *fd_owner;
+    *fd_owner = -1;
+    *out_connection = candidate;
+    return finish(error, VIREO_OK, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+}
+
+vireo_result_t vireo_connection_create_tls_server(vireo_tls_context_t const *context,
+    vireo_tls_connection_options_t const *tls_options, int *fd_owner,
+    vireo_connection_t **out_connection, vireo_connection_error_t *error)
+{
+    return vireo_connection_create_tls_server_with_ops(context, tls_options, fd_owner,
+        &system_ops, out_connection, error);
+}
+
+vireo_result_t vireo_connection_tls_borrow(vireo_connection_t *connection,
+    vireo_tls_connection_t **out_borrowed_tls)
+{
+    if (connection == NULL || out_borrowed_tls == NULL) { return VIREO_RESULT_INVALID_ARGUMENT; }
+    if (connection->owned_tls == NULL) { return VIREO_RESULT_NOT_FOUND; }
+    *out_borrowed_tls = connection->owned_tls;
+    return VIREO_OK;
+}
+
 vireo_result_t vireo_connection_create_with_ops(vireo_connection_options_t const *options,
                                                 int *fd_owner,
                                                 vireo_connection_ops_t const *ops,
@@ -389,11 +472,7 @@ vireo_result_t vireo_connection_create_with_ops(vireo_connection_options_t const
     int saved_errno = errno;
     size_t capacity_bytes = 0;
     if (options == NULL || fd_owner == NULL || out_connection == NULL ||
-        *fd_owner < 0 || *out_connection != NULL || ops == NULL ||
-        ops->allocate == NULL || ops->deallocate == NULL || ops->get_flags == NULL ||
-        ops->socket_type == NULL || ops->peer_connected == NULL || ops->close_fd == NULL ||
-        ops->create_buffer == NULL || ops->destroy_buffer == NULL || ops->receive == NULL ||
-        ops->send_bytes == NULL) {
+        *fd_owner < 0 || *out_connection != NULL || !resource_ops_valid(ops)) {
         return finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                       VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
     }
@@ -504,17 +583,29 @@ vireo_result_t vireo_connection_inspect(vireo_connection_t const *connection,
         return VIREO_RESULT_INVALID_ARGUMENT;
     }
     vireo_connection_info_t candidate = {0};
-    vireo_result_t result = vireo_buffer_inspect(connection->read_buffer, &candidate.read_buffer);
-    if (result != VIREO_OK) {
-        return result;
+    if (connection->owned_tls != NULL) {
+        vireo_tls_io_info_t io;
+        vireo_result_t result = vireo_tls_connection_io_inspect(connection->owned_tls, &io, NULL);
+        if (result != VIREO_OK) { return result; }
+        candidate.transport = VIREO_CONNECTION_TRANSPORT_TLS;
+        candidate.read_buffer = io.read_buffer;
+        candidate.write_buffer = io.write_buffer;
+        candidate.read_eof = io.read_eof;
+        if (io.state != VIREO_TLS_IO_DISABLED) {
+            /* configure已受检两容量+两暂存；仅派生两FIFO预算，不伪造尾空。 */
+            candidate.buffer_capacity_bytes = io.options.read_capacity + io.options.write_capacity;
+            candidate.max_buffer_bytes = io.options.max_buffer_bytes -
+                (io.buffer_bytes - candidate.buffer_capacity_bytes);
+        }
+    } else {
+        vireo_result_t result = vireo_buffer_inspect(connection->read_buffer, &candidate.read_buffer);
+        if (result != VIREO_OK) { return result; }
+        result = vireo_buffer_inspect(connection->write_buffer, &candidate.write_buffer);
+        if (result != VIREO_OK) { return result; }
+        candidate.buffer_capacity_bytes = connection->buffer_capacity_bytes;
+        candidate.max_buffer_bytes = connection->max_buffer_bytes;
+        candidate.read_eof = connection->read_eof;
     }
-    result = vireo_buffer_inspect(connection->write_buffer, &candidate.write_buffer);
-    if (result != VIREO_OK) {
-        return result;
-    }
-    candidate.buffer_capacity_bytes = connection->buffer_capacity_bytes;
-    candidate.max_buffer_bytes = connection->max_buffer_bytes;
-    candidate.read_eof = connection->read_eof;
     candidate.loop_attached = connection->loop_attached;
     candidate.loop_interests = connection->loop_interests;
     candidate.callback_active = connection->callback_active;
@@ -573,6 +664,9 @@ vireo_result_t vireo_connection_receive(vireo_connection_t *connection,
     }
     if (budget->max_bytes == 0 || budget->max_syscalls == 0) {
         return finish(error, VIREO_RESULT_RANGE, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    }
+    if (connection->owned_tls != NULL) {
+        return finish(error, VIREO_RESULT_BUSY, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
     }
     vireo_connection_receive_info_t info = {0, 0, VIREO_CONNECTION_RECEIVE_STOP_ERROR};
     if (connection->close_state != VIREO_CONNECTION_CLOSE_OPEN) {
@@ -648,6 +742,9 @@ vireo_result_t vireo_connection_read_peek(vireo_connection_t const *connection,
     if (connection == NULL) {
         return VIREO_RESULT_INVALID_ARGUMENT;
     }
+    if (connection->owned_tls != NULL) {
+        return vireo_tls_connection_read_peek(connection->owned_tls, out_data, out_size, NULL);
+    }
     return vireo_buffer_peek(connection->read_buffer, out_data, out_size);
 }
 
@@ -655,6 +752,9 @@ vireo_result_t vireo_connection_read_consume(vireo_connection_t *connection, siz
 {
     if (connection == NULL) {
         return VIREO_RESULT_INVALID_ARGUMENT;
+    }
+    if (connection->owned_tls != NULL) {
+        return vireo_tls_connection_read_consume(connection->owned_tls, size, NULL);
     }
     return vireo_buffer_consume(connection->read_buffer, size);
 }
@@ -716,10 +816,22 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
         return frame_finish(NULL, info, error, VIREO_RESULT_INVALID_ARGUMENT,
                             none, codec_none, saved_errno);
     }
-    vireo_buffer_info_t buffer_info;
+    vireo_connection_info_t current;
+    if (vireo_connection_inspect(connection, &current) != VIREO_OK) {
+        return frame_finish(out_info, info, error, VIREO_RESULT_INTERNAL, none, codec_none, saved_errno);
+    }
+    size_t tls_unit = 0;
+    if (connection->owned_tls != NULL) {
+        vireo_tls_io_info_t io;
+        (void)vireo_tls_connection_io_inspect(connection->owned_tls, &io, NULL);
+        if (io.state == VIREO_TLS_IO_DISABLED || io.state == VIREO_TLS_IO_PREPARED) {
+            return frame_finish(NULL, info, error, VIREO_RESULT_BUSY, none, codec_none, saved_errno);
+        }
+        tls_unit = io.options.max_read_unit_bytes;
+    }
+    vireo_buffer_info_t buffer_info = current.read_buffer;
     size_t protocol_max = 0;
-    if (vireo_buffer_inspect(connection->read_buffer, &buffer_info) != VIREO_OK ||
-        vireo_checked_u64_to_size((uint64_t)VIREO_PROTOCOL_MAX_BODY_SIZE,
+    if (vireo_checked_u64_to_size((uint64_t)VIREO_PROTOCOL_MAX_BODY_SIZE,
                                   &protocol_max) != VIREO_OK ||
         vireo_checked_size_add(header_size, protocol_max, &protocol_max) != VIREO_OK) {
         return frame_finish(out_info, info, error, VIREO_RESULT_INTERNAL,
@@ -728,6 +840,7 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
     if (view_capacity == 0 || budget->max_messages == 0 || budget->max_bytes == 0 ||
         options->max_frame_bytes < header_size ||
         options->max_frame_bytes > buffer_info.capacity ||
+        (connection->owned_tls != NULL && options->max_frame_bytes > tls_unit) ||
         options->max_frame_bytes > protocol_max || budget->max_bytes < options->max_frame_bytes ||
         (connection->flow_enabled &&
          options->max_frame_bytes > connection->flow_options.max_frame_bytes)) {
@@ -735,7 +848,7 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
     }
     uint8_t const *bytes = NULL;
     size_t readable = 0;
-    if (vireo_buffer_peek(connection->read_buffer, &bytes, &readable) != VIREO_OK) {
+    if (vireo_connection_read_peek(connection, &bytes, &readable) != VIREO_OK) {
         return frame_finish(out_info, info, error, VIREO_RESULT_INTERNAL,
                             none, codec_none, saved_errno);
     }
@@ -750,7 +863,7 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
         }
         size_t remaining = readable - info.frame_bytes;
         if (remaining == 0) {
-            info.stop_reason = connection->read_eof ? VIREO_CONNECTION_FRAME_STOP_EOF :
+            info.stop_reason = current.read_eof ? VIREO_CONNECTION_FRAME_STOP_EOF :
                                                      VIREO_CONNECTION_FRAME_STOP_NEED_MORE;
             break;
         }
@@ -760,7 +873,7 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
             break;
         }
         if (remaining < header_size) {
-            if (!connection->read_eof) {
+            if (!current.read_eof) {
                 info.stop_reason = VIREO_CONNECTION_FRAME_STOP_NEED_MORE;
                 break;
             }
@@ -802,7 +915,7 @@ vireo_result_t vireo_connection_frames_peek(vireo_connection_t const *connection
             break;
         }
         if (wire_size > remaining) {
-            if (!connection->read_eof) {
+            if (!current.read_eof) {
                 info.stop_reason = VIREO_CONNECTION_FRAME_STOP_NEED_MORE;
                 break;
             }
@@ -842,6 +955,11 @@ vireo_result_t vireo_connection_write_enqueue(vireo_connection_t *connection,
     if (connection == NULL || (size != 0 && bytes == NULL)) {
         return finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                       VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    }
+    if (connection->owned_tls != NULL) {
+        vireo_tls_connection_error_t dependency = {0};
+        vireo_result_t result = vireo_tls_connection_enqueue(connection->owned_tls, bytes, size, &dependency);
+        return tls_finish(error, result, &dependency, saved_errno);
     }
     vireo_buffer_info_t buffer_info;
     if (vireo_buffer_inspect(connection->write_buffer, &buffer_info) != VIREO_OK) {
@@ -914,6 +1032,9 @@ vireo_result_t vireo_connection_send(vireo_connection_t *connection,
     if (budget->max_bytes == 0 || budget->max_syscalls == 0) {
         return finish(error, VIREO_RESULT_RANGE, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
     }
+    if (connection->owned_tls != NULL) {
+        return finish(error, VIREO_RESULT_BUSY, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    }
     if (connection->close_state == VIREO_CONNECTION_CLOSE_READY) {
         return finish(error, VIREO_RESULT_BUSY, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
     }
@@ -981,6 +1102,9 @@ vireo_result_t vireo_connection_destroy(vireo_connection_t **connection,
     vireo_connection_t *owned = *connection;
     if (owned->loop_attached || owned->callback_active) {
         return finish(error, VIREO_RESULT_BUSY, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    }
+    if (owned->owned_tls != NULL) {
+        (void)vireo_tls_connection_destroy(&owned->owned_tls, NULL);
     }
     int failed = owned->ops.close_fd(owned->ops.context, owned->owned_fd);
     int cause = failed < 0 ? errno : 0;
@@ -1275,6 +1399,10 @@ vireo_result_t vireo_connection_flow_configure(
         return loop_finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
     }
+    if (connection->owned_tls != NULL) {
+        return loop_finish(error, VIREO_RESULT_BUSY,
+            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
+    }
     if (connection->close_state != VIREO_CONNECTION_CLOSE_OPEN) {
         return loop_finish(error, VIREO_RESULT_BUSY,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
@@ -1317,6 +1445,10 @@ vireo_result_t vireo_connection_flow_refresh(vireo_connection_t *connection,
         return loop_finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
     }
+    if (connection->owned_tls != NULL) {
+        return loop_finish(error, VIREO_RESULT_BUSY,
+            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
+    }
     if (connection->close_state != VIREO_CONNECTION_CLOSE_OPEN) {
         return loop_finish(error, VIREO_RESULT_BUSY,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
@@ -1341,6 +1473,10 @@ vireo_result_t vireo_connection_flow_disable(vireo_connection_t *connection,
     if (connection == NULL) {
         return loop_finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
+    }
+    if (connection->owned_tls != NULL) {
+        return loop_finish(error, VIREO_RESULT_BUSY,
+            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
     }
     if (connection->close_state != VIREO_CONNECTION_CLOSE_OPEN) {
         return loop_finish(error, VIREO_RESULT_BUSY,
@@ -1409,6 +1545,10 @@ vireo_result_t vireo_connection_request_close(
         return loop_finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
     }
+    if (connection->owned_tls != NULL) {
+        return loop_finish(error, VIREO_RESULT_BUSY,
+            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
+    }
     if (connection->close_mode == VIREO_CONNECTION_CLOSE_MODE_IMMEDIATE &&
         mode == VIREO_CONNECTION_CLOSE_MODE_DRAIN) {
         return loop_finish(error, VIREO_RESULT_BUSY,
@@ -1433,6 +1573,10 @@ vireo_result_t vireo_connection_close_refresh(vireo_connection_t *connection,
     if (connection == NULL) {
         return loop_finish(error, VIREO_RESULT_INVALID_ARGUMENT,
                            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
+    }
+    if (connection->owned_tls != NULL) {
+        return loop_finish(error, VIREO_RESULT_BUSY,
+            VIREO_CONNECTION_LOOP_STAGE_NONE, NULL, saved_errno);
     }
     if (connection->close_state == VIREO_CONNECTION_CLOSE_OPEN) {
         return loop_finish(error, VIREO_RESULT_NOT_FOUND,

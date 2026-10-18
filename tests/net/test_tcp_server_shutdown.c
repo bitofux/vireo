@@ -118,7 +118,7 @@ static vireo_result_t create_connection(void *ctx, vireo_connection_options_t co
 {
     fixture_t *f = ctx; ++f->creates;
     if (f->creates == f->fail_create) {
-        *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_CREATE_READ_BUFFER, 0};
+        *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_CREATE_READ_BUFFER, .system_errno = 0};
         return VIREO_RESULT_NO_MEMORY;
     }
     return vireo_connection_create(o, fd, c, e);
@@ -183,7 +183,7 @@ static vireo_result_t release_connection(void *ctx, vireo_connection_pool_t *p,
     errno = E2BIG;
     if (!f->release_io) return r;
     *e = (vireo_connection_pool_operation_error_t){VIREO_CONNECTION_POOL_OPERATION_DESTROY_CONNECTION,
-        {VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EINTR}};
+        {.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EINTR}};
     return VIREO_RESULT_IO;
 }
 static vireo_result_t destroy_connection(void *ctx, vireo_connection_t **c, vireo_connection_error_t *e)
@@ -191,7 +191,7 @@ static vireo_result_t destroy_connection(void *ctx, vireo_connection_t **c, vire
     fixture_t *f = ctx; ++f->destroys;
     vireo_result_t const r = vireo_connection_destroy(c, e); REQUIRE(r == VIREO_OK && *c == NULL);
     if (!f->destroy_io) return r;
-    *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EIO}; return VIREO_RESULT_IO;
+    *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EIO}; return VIREO_RESULT_IO;
 }
 static int close_fd(void *ctx, int fd)
 {

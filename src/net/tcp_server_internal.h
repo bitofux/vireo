@@ -10,6 +10,44 @@
 #define VIREO_NET_TCP_SERVER_INTERNAL_H
 
 #include <vireo/net/tcp_server.h>
+#include <vireo/net/tcp_server_tls.h>
+
+/** 仅本server测试的TLS依赖桥接，完整按值保存；NULL选择生产表。
+ * context借至destroy，资源交接/失败保持遵从各公共API；不能伪造消费或读外模块private。
+ * now只能同单调域；step/inspect模型证据须与真实网络证据分列，不能提升为native验证。
+ */
+typedef struct vireo_tcp_server_tls_ops {
+    void *context;
+    vireo_result_t (*now)(void *, vireo_monotonic_ns_t *, vireo_clock_error_t *);
+    vireo_result_t (*create)(void *, vireo_tls_context_t const *,
+        vireo_tls_connection_options_t const *, int *, vireo_connection_t **, vireo_connection_error_t *);
+    vireo_result_t (*prepare)(void *, vireo_tls_connection_t *, vireo_tls_io_options_t const *,
+        vireo_tls_connection_error_t *);
+    vireo_result_t (*arm)(void *, vireo_tls_connection_t *, vireo_monotonic_ns_t,
+        vireo_monotonic_ns_t, vireo_tls_connection_error_t *);
+    vireo_result_t (*inspect)(void *, vireo_tls_connection_t const *, vireo_tls_connection_info_t *,
+        vireo_tls_connection_error_t *);
+    vireo_result_t (*deadline)(void *, vireo_tls_connection_t const *,
+        vireo_tls_handshake_deadline_info_t *, vireo_tls_connection_error_t *);
+    vireo_result_t (*step)(void *, vireo_tls_connection_t *, vireo_monotonic_ns_t,
+        vireo_tls_handshake_info_t *, vireo_tls_connection_error_t *);
+    vireo_result_t (*io_inspect)(void *, vireo_tls_connection_t const *, vireo_tls_io_info_t *,
+        vireo_tls_connection_error_t *);
+    vireo_result_t (*flow_refresh)(void *, vireo_tls_connection_t *, vireo_tls_io_flow_t *,
+        vireo_tls_connection_error_t *);
+    vireo_result_t (*receive)(void *, vireo_tls_connection_t *, vireo_tls_io_budget_t const *,
+        vireo_tls_io_progress_t *, vireo_tls_connection_error_t *);
+    vireo_result_t (*send)(void *, vireo_tls_connection_t *, vireo_tls_io_budget_t const *,
+        vireo_tls_io_progress_t *, vireo_tls_connection_error_t *);
+    vireo_result_t (*close_inspect)(void *, vireo_tls_connection_t const *, vireo_tls_close_info_t *,
+        vireo_tls_connection_error_t *);
+    vireo_result_t (*close_request)(void *, vireo_tls_connection_t *, vireo_monotonic_ns_t,
+        vireo_monotonic_ns_t, vireo_tls_connection_error_t *);
+    vireo_result_t (*close_step_at)(void *, vireo_tls_connection_t *, vireo_monotonic_ns_t,
+        size_t, vireo_tls_close_progress_t *, vireo_tls_connection_error_t *);
+} vireo_tcp_server_tls_ops_t;
+
+
 
 /**
  * 完整表按值复制，context 借用至 destroy 返回，无全局可变 hooks，不属于下游 API。
@@ -260,5 +298,130 @@ vireo_result_t vireo_tcp_server_poll_with_listener_once_with_gate(vireo_tcp_serv
     int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
     size_t client_capacity, vireo_tcp_server_listener_poll_report_t *report,
     vireo_tcp_server_poll_queue_gate_t gate, void *context);
+
+/** 本server TLS构造seam；旧表NULL选系统表，TLS表NULL也选系统；禁止下游使用。
+ * TLS options/context/output/error沿新公共构造；own失败不得先执行成功交接再假装拒绝。
+ */
+vireo_result_t vireo_tcp_server_create_tls_with_ops(vireo_tcp_server_options_t const *,
+    vireo_tcp_server_tls_options_t const *, vireo_tls_context_t **,
+    vireo_tcp_server_ops_t const *, vireo_tcp_server_client_ops_t const *,
+    vireo_tcp_server_scheduler_ops_t const *, vireo_tcp_server_tls_ops_t const *,
+    vireo_tcp_server_t **, vireo_tcp_server_tls_error_t *);
+
+/**
+ * @brief 本核心TLS完整依赖构造，增加原监听表可控桥接
+ * @param[in] options 原资源根配置，调用期短借。
+ * @param[in] tls_options 原固定TLS数值配置。
+ * @param[in,out] context_owner 原唯一context，成功才move。
+ * @param[in] base_ops 可空原资源表，NULL用系统表。
+ * @param[in] listener_ops 可空原完整监听表，NULL用系统表；context借到destroy。
+ * @param[in] client_ops 可空原客户表。
+ * @param[in] scheduler_ops 可空原等待表。
+ * @param[in] tls_ops 可空原TLS十五项表，不访问外核心private。
+ * @param[in,out] out_server 独立空owner，成功才发布。
+ * @param[out] error 原可空完整诊断。
+ * @return 原TLS构造分类；表缺项INVALID_ARGUMENT，无全局hook。
+ * @note 原分配/失败交接/errno合同保持；仅本核心测试，不授予下游接口。
+ */
+vireo_result_t vireo_tcp_server_create_tls_with_all_ops(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, vireo_tls_context_t **context_owner,
+    vireo_tcp_server_ops_t const *base_ops, vireo_tcp_server_listener_ops_t const *listener_ops,
+    vireo_tcp_server_client_ops_t const *client_ops, vireo_tcp_server_scheduler_ops_t const *scheduler_ops,
+    vireo_tcp_server_tls_ops_t const *tls_ops, vireo_tcp_server_t **out_server,
+    vireo_tcp_server_tls_error_t *error);
+
+/**
+ * @brief 本server正辅助容量TLS构造seam，仅资源失败测试使用
+ * @param[in] options 原短借server配置。
+ * @param[in] tls_options 原短借TLS配置。
+ * @param[in] auxiliary_capacity 原公共正辅助容量，总注册受检。
+ * @param[in,out] context_owner 原context唯一owner，成功才move。
+ * @param[in] base_ops 可空原本核心资源表；context借到destroy，NULL用系统表。
+ * @param[in,out] out_server 原独立NULL owner，失败保持。
+ * @param[out] error 原完整TLS诊断，主因及清理次因分别保留。
+ * @return 新公共容量入口分类，保持errno；无新增全局hook或外核心private访问。
+ * @note 其余表均系统实现；不授予下游使用此头的权限。
+ */
+vireo_result_t vireo_tcp_server_create_tls_with_auxiliary_ops(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, size_t auxiliary_capacity,
+    vireo_tls_context_t **context_owner, vireo_tcp_server_ops_t const *base_ops,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error);
+
+/** 本server应用入队前只读故障门，非生产API；失败不能修改对象或伪造提交。
+ * context仅借到本次返回，不持久保存，NULL走真实queue_append。模型不等内核故障。 */
+typedef vireo_result_t (*vireo_tcp_server_tls_application_queue_gate_t)(void *,
+    vireo_tcp_server_t const *, vireo_connection_pool_lease_t);
+
+/**
+ * @brief 本核心有限serve的新客户发布后排队故障门，公共入口固定NULL
+ * @param[in,out] server 原存活TLS根，无其他在途。
+ * @param[in] options 原完整服务数值。
+ * @param[in,out] wire_workspace 原独立工作区。
+ * @param[in] workspace_capacity 原工作区长度。
+ * @param[in] handler 原非阻塞有界回调。
+ * @param[in,out] context 原可空短借回调上下文。
+ * @param[out] out_turns 原真实turn前缀。
+ * @param[in] turn_capacity 原正数组长度。
+ * @param[in,out] out_clients 原全零潜在租约前缀。
+ * @param[in] client_capacity 原正数组长度。
+ * @param[out] out_info 原必需事实。
+ * @param[out] error 原可空完整诊断。
+ * @param[in] gate 可空只读门，失败不能改变任何owner/状态；NULL执行真实queue_append。
+ * @param[in,out] gate_context gate调用期短借，不保存。
+ * @return 原有限serve分类，门失败仍保留已发布lease。
+ * @note 无保护豁免参数；只用于本core模型，不等真实内核故障，保持errno。
+ */
+vireo_result_t vireo_tcp_server_tls_serve_once_with_gate(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_serve_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_connection_pool_lease_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_tls_serve_info_t *out_info, vireo_tcp_server_tls_serve_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context);
+
+/**
+ * @brief 本core客户轮交接排队故障门，公共入口固定NULL
+ * @param[in,out] server 沿公共客户轮存活TLS根。
+ * @param[in] options 原完整数值选项。
+ * @param[in,out] wire_workspace caller独立工作区短借。
+ * @param[in] workspace_capacity 原响应字节容量。
+ * @param[in] handler 原有界同步handler。
+ * @param[in,out] context 可空handler短借上下文。
+ * @param[out] out_turns 原真实结果前缀。
+ * @param[in] turn_capacity 原正元素数。
+ * @param[out] out_info 原整轮报告。
+ * @param[out] error 可空原完整原因。
+ * @param[in] gate 可空交接前故障门，仅只读观察，不改队列/资源。
+ * @param[in,out] gate_context gate上下文，借到返回。
+ * @return 沿公共分类；gate拒绝保留已建立握手和其余待办。
+ * @note 不授予外部绕过任何在途保护的能力；仅本server测试使用，保持errno。
+ */
+vireo_result_t vireo_tcp_server_tls_run_once_with_gate(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_round_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_tcp_server_tls_round_info_t *out_info, vireo_tcp_server_tls_round_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context);
+
+
+vireo_result_t vireo_tcp_server_client_tls_flow_refresh_with_gate(vireo_tcp_server_t *,
+    vireo_connection_pool_lease_t, vireo_tcp_server_tls_flow_info_t *,
+    vireo_tcp_server_tls_application_error_t *, vireo_tcp_server_tls_application_queue_gate_t, void *);
+vireo_result_t vireo_tcp_server_client_tls_drive_with_gate(vireo_tcp_server_t *,
+    vireo_connection_pool_lease_t, vireo_tcp_server_process_options_t const *,
+    vireo_tcp_server_tls_drive_budget_t const *, uint8_t *, size_t, vireo_tcp_server_sync_handler_t,
+    void *, vireo_tcp_server_tls_drive_info_t *, vireo_tcp_server_tls_application_error_t *,
+    vireo_tcp_server_tls_application_queue_gate_t, void *);
+
+/** 仅本server单次关闭入队故障门；沿应用gate短借/只读合同，不持久保存。 */
+vireo_result_t vireo_tcp_server_client_tls_close_request_with_gate(vireo_tcp_server_t *,
+    vireo_connection_pool_lease_t, uint64_t, vireo_tcp_server_tls_close_request_info_t *,
+    vireo_tcp_server_tls_close_error_t *, vireo_tcp_server_tls_application_queue_gate_t, void *);
+vireo_result_t vireo_tcp_server_client_tls_close_step_with_gate(vireo_tcp_server_t *,
+    vireo_connection_pool_lease_t, size_t, vireo_tcp_server_tls_close_step_info_t *,
+    vireo_tcp_server_tls_close_error_t *, vireo_tcp_server_tls_application_queue_gate_t, void *);
+vireo_result_t vireo_tcp_server_client_tls_close_flow_refresh_with_gate(vireo_tcp_server_t *,
+    vireo_connection_pool_lease_t, vireo_tcp_server_tls_close_flow_info_t *,
+    vireo_tcp_server_tls_close_error_t *, vireo_tcp_server_tls_application_queue_gate_t, void *);
 
 #endif /* VIREO_NET_TCP_SERVER_INTERNAL_H */

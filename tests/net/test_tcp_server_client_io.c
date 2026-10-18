@@ -85,7 +85,7 @@ static vireo_result_t receive_bytes(void *ctx, vireo_connection_t *c,
     REQUIRE(vireo_connection_receive(c, f->partial ? &small : b, i, e) == VIREO_OK);
     if (f->partial) { REQUIRE(i->received_bytes == 2 && b->max_syscalls >= 2); ++i->recv_calls; }
     i->stop_reason = VIREO_CONNECTION_RECEIVE_STOP_ERROR;
-    *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_RECEIVE, EINTR};
+    *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_RECEIVE, .system_errno = EINTR};
     errno = ERANGE; return VIREO_RESULT_IO;
 }
 static vireo_result_t peek_bytes(void *ctx, vireo_connection_t const *c, uint8_t const **p, size_t *n)
@@ -110,7 +110,7 @@ static vireo_result_t send_bytes(void *ctx, vireo_connection_t *c,
         ++i->send_calls;
     } else *i = (vireo_connection_send_info_t){.send_calls = 1};
     i->stop_reason = VIREO_CONNECTION_SEND_STOP_ERROR;
-    *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_SEND, EPIPE};
+    *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_SEND, .system_errno = EPIPE};
     errno = ERANGE; return VIREO_RESULT_IO;
 }
 static vireo_result_t frame_views(void *ctx, vireo_connection_t const *c,

@@ -207,7 +207,7 @@ static void check_none(vireo_connection_error_t const *error)
 
 static void enqueue(fixture_t *f, void const *bytes, size_t size, vireo_result_t expected)
 {
-    vireo_connection_error_t error = {VIREO_CONNECTION_STAGE_SEND, EIO};
+    vireo_connection_error_t error = {.stage = VIREO_CONNECTION_STAGE_SEND, .system_errno = EIO};
     vireo_connection_info_t before = state(f);
     errno = EDOM;
     CHECK(vireo_connection_write_enqueue(f->connection, bytes, size, &error) == expected);
@@ -230,7 +230,7 @@ static vireo_connection_send_info_t transmit(fixture_t *f, size_t bytes, size_t 
 {
     vireo_connection_send_budget_t budget = {bytes, calls};
     vireo_connection_send_info_t info;
-    vireo_connection_error_t error = {VIREO_CONNECTION_STAGE_ENQUEUE, ENOMEM};
+    vireo_connection_error_t error = {.stage = VIREO_CONNECTION_STAGE_ENQUEUE, .system_errno = ENOMEM};
     vireo_connection_info_t before = state(f);
     errno = E2BIG;
     CHECK(vireo_connection_send(f->connection, &budget, &info, &error) == result);

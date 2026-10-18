@@ -282,7 +282,7 @@ static void test_public_lifecycle(void)
     int original_flags = fcntl(fd, F_GETFL);
     int original_fd_flags = fcntl(fd, F_GETFD);
     vireo_connection_t *connection = NULL;
-    vireo_connection_error_t error = {VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EIO};
+    vireo_connection_error_t error = {.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EIO};
     errno = E2BIG;
     CHECK(vireo_connection_create(&options, &fd, &connection, &error) == VIREO_OK);
     CHECK(errno == E2BIG);

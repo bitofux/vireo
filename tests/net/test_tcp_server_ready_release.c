@@ -119,7 +119,7 @@ static vireo_result_t create_client(void *ctx, vireo_connection_options_t const 
     fixture_t *f = ctx;
     ++f->create_calls;
     if (f->fail_create_on == f->create_calls) {
-        *error = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_ALLOCATE_CONTROL, 0};
+        *error = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_ALLOCATE_CONTROL, .system_errno = 0};
         return VIREO_RESULT_NO_MEMORY;
     }
     int const raw = *fd;
@@ -182,7 +182,7 @@ static vireo_result_t release_client(void *ctx, vireo_connection_pool_t *pool,
     if (r == VIREO_OK && f->release_io) { /* 真实消费后注入 IO，不能再次 close。 */
         error->stage = VIREO_CONNECTION_POOL_OPERATION_DESTROY_CONNECTION;
         error->connection_error =
-            (vireo_connection_error_t){VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EINTR};
+            (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EINTR};
         return VIREO_RESULT_IO;
     }
     return r;

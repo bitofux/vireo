@@ -79,6 +79,12 @@ struct vireo_tcp_server {
     vireo_event_loop_handle_t auxiliary_handle; /**< 唯一辅助登记身份，未绑定全零。 */
     int auxiliary_fd; /**< 借用fd，未绑定−1；不由server关闭。 */
     uint32_t auxiliary_pending_events; /**< 内部回调OR，安全窗口取出或成功DEL清零。 */
+    vireo_tls_context_t *owned_tls_context; /**< 非空即固定TLS模式；供以后SSL创建，空根destroy释放。 */
+    vireo_tcp_server_tls_options_t tls_options; /**< 创建时数值副本，不保留caller地址。 */
+    size_t context_wrapper_bytes; /**< TLS根总预算中的真实context包装，RAW为0。 */
+    size_t tls_pair_bytes; /**< 固定两FIFO账，入池/释放复用原buffer_bytes。 */
+    size_t tls_per_connection_bytes; /**< pair+两暂存，当前总额由client_count受检推导。 */
+    vireo_tcp_server_tls_ops_t tls_ops; /**< 仅本核心依赖桥接；无第二客户状态或owner。 */
     client_slot_t clients[]; /**< 随 control 单次固定申请，槽地址至 destroy 保持。 */
 };
 
@@ -970,6 +976,7 @@ vireo_result_t vireo_tcp_server_inspect(vireo_tcp_server_t const *server,
         pool_info.index_bytes != server->pool_origin.index_bytes ||
         vireo_checked_size_add(server->server_bytes, loop_info.allocation_bytes, &subtotal) != VIREO_OK ||
         vireo_checked_size_add(subtotal, pool_info.allocation_bytes, &total) != VIREO_OK ||
+        vireo_checked_size_add(total, server->context_wrapper_bytes, &total) != VIREO_OK ||
         total > server->options.max_memory_bytes) {
         return finish(VIREO_RESULT_INTERNAL, &unused, NULL, saved_errno);
     }
@@ -1091,6 +1098,9 @@ vireo_result_t vireo_tcp_server_destroy(vireo_tcp_server_t **server,
             }
         }
     }
+    /* pool已空且loop消费后，不再有SSL创建或回调借用；context销毁不做网络。 */
+    if (owner->owned_tls_context != NULL)
+        (void)vireo_tls_context_destroy(&owner->owned_tls_context, NULL);
     owner->ops.deallocate(owner->ops.context, owner);
     *server = NULL;
     return finish(result, &detail, error, saved_errno);
@@ -1476,7 +1486,7 @@ static vireo_result_t admit_clients(vireo_tcp_server_t *server,
     if (server == NULL || options == NULL || budget == NULL || out_clients == NULL || out_info == NULL ||
         budget->max_accepts == 0 || budget->max_accept_syscalls == 0)
         return client_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || (server->serving_active && !from_serve)) return client_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || (server->serving_active && !from_serve)) return client_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
     if (capacity == 0 || capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
         budget->max_accepts > VIREO_TCP_SERVER_MAX_CONNECTIONS)
         return client_finish(VIREO_RESULT_RANGE, &detail, error, saved_errno);
@@ -2351,7 +2361,7 @@ static vireo_result_t drive_client(vireo_tcp_server_t *server,
     if (server == NULL || options == NULL || budget == NULL || wire_workspace == NULL ||
         handler == NULL || out_info == NULL)
         return drive_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active ||
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active ||
         (server->scheduling_active && !from_scheduler) || (server->serving_active && !from_scheduler))
         return drive_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
     vireo_tcp_server_process_options_t const limits = *options;
@@ -2647,7 +2657,7 @@ static vireo_result_t run_round(vireo_tcp_server_t *server, int timeout_ms,
     if (server == NULL || options == NULL || drive_budget == NULL || round_budget == NULL ||
         wire_workspace == NULL || handler == NULL || out_turns == NULL || out_info == NULL || timeout_ms < -1)
         return round_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || ((server->serving_active || server->running_active) && !from_serve))
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || ((server->serving_active || server->running_active) && !from_serve))
         return round_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
     vireo_tcp_server_process_options_t const limits = *options;
     vireo_tcp_server_drive_budget_t const per_client = *drive_budget;
@@ -2851,7 +2861,7 @@ vireo_result_t vireo_tcp_server_admission_configure(vireo_tcp_server_t *server,
     int const saved = errno;
     vireo_tcp_server_listener_error_t detail = {0};
     if (server == NULL || options == NULL) return listener_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
         return listener_finish(VIREO_RESULT_BUSY, &detail, error, saved);
     vireo_tcp_server_admission_options_t const copy = *options;
     size_t pair = 0;
@@ -2871,7 +2881,7 @@ vireo_result_t vireo_tcp_server_admission_refresh(vireo_tcp_server_t *server,
     int const saved = errno;
     vireo_tcp_server_listener_error_t detail = {0};
     if (server == NULL) return listener_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
         return listener_finish(VIREO_RESULT_BUSY, &detail, error, saved);
     vireo_result_t const result = server->admission_enabled
         ? admission_sync(server, server->admission_pair_bytes, &detail) : VIREO_RESULT_NOT_FOUND;
@@ -2884,7 +2894,7 @@ vireo_result_t vireo_tcp_server_admission_disable(vireo_tcp_server_t *server,
     int const saved = errno;
     vireo_tcp_server_listener_error_t detail = {0};
     if (server == NULL) return listener_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active)
         return listener_finish(VIREO_RESULT_BUSY, &detail, error, saved);
     server->admission_enabled = false;
     server->admission_options = (vireo_tcp_server_admission_options_t){0};
@@ -2964,7 +2974,7 @@ static vireo_result_t serve_round(vireo_tcp_server_t *server,
     if (server == NULL || options == NULL || wire_workspace == NULL || handler == NULL ||
         out_turns == NULL || out_clients == NULL || out_info == NULL)
         return serve_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
-    if (server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active || (server->running_active && !from_run))
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active || server->driving_active || server->scheduling_active || server->serving_active || (server->running_active && !from_run))
         return serve_finish(VIREO_RESULT_BUSY, &detail, error, saved);
     vireo_tcp_server_serve_options_t const o = *options;
     if (o.timeout_ms < -1 || o.admit.max_accepts == 0 || o.admit.max_accept_syscalls == 0)
@@ -3119,7 +3129,7 @@ vireo_result_t vireo_tcp_server_run(vireo_tcp_server_t *server,
         out_turns == NULL || out_clients == NULL || callback == NULL) {
         result = VIREO_RESULT_INVALID_ARGUMENT; goto finished;
     }
-    if (server->closing_active || server->shutdown_active || server->running_active || server->processing_active || server->driving_active ||
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->running_active || server->processing_active || server->driving_active ||
         server->scheduling_active || server->serving_active) {
         result = VIREO_RESULT_BUSY; goto finished;
     }
@@ -3193,7 +3203,7 @@ vireo_result_t vireo_tcp_server_set_auto_close_policy(vireo_tcp_server_t *server
     vireo_tcp_server_client_error_t detail = {0};
     if (server == NULL)
         return client_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
-    if (server->processing_active || server->driving_active || server->scheduling_active ||
+    if (server->owned_tls_context != NULL || server->processing_active || server->driving_active || server->scheduling_active ||
         server->serving_active || server->closing_active || server->shutdown_active)
         return client_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
     server->auto_close_policy = enabled;
@@ -3252,7 +3262,7 @@ vireo_result_t vireo_tcp_server_close_batch_with_gate(vireo_tcp_server_t *server
     size_t const max_slots = budget->max_slots;
     if (max_slots > VIREO_TCP_SERVER_MAX_CONNECTIONS || result_capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS)
         return close_batch_finish(VIREO_RESULT_RANGE, &detail, error, saved_errno);
-    if (server->closing_active || server->shutdown_active || server->processing_active ||
+    if (server->owned_tls_context != NULL || server->closing_active || server->shutdown_active || server->processing_active ||
         server->driving_active || server->scheduling_active || server->serving_active)
         return close_batch_finish(VIREO_RESULT_BUSY, &detail, error, saved_errno);
     bool stopped = false;
@@ -3334,6 +3344,103 @@ vireo_result_t vireo_tcp_server_close_batch(vireo_tcp_server_t *server,
 }
 
 /**
+ * @brief 单次扫描固定槽，公开读取state/due并可安排到期机会
+ *
+ * @param[in,out] server
+ *     非空TLS根，已持scheduling_active，客户/队列只在此Reactor变化。
+ * @param[in] enqueue
+ *     false为等待前最近due扫描，true为等待后到期排队。
+ * @param[in] now
+ *     后扫描的新同域采样；前扫描忽略此值。
+ * @param[in,out] report
+ *     非空本次局部报告，累计槽检查/期限/到期计数。
+ * @param[in,out] detail
+ *     非空本次诊断，失败保持实际扫描阶段与原TLS原因。
+ *
+ * @return
+ *     OK完成N槽；原观察失败或INTERNAL停止，不回滚已经排入的到期项。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_scan(vireo_tcp_server_t *, bool, vireo_monotonic_ns_t,
+    vireo_tcp_server_tls_poll_report_t *, vireo_tcp_server_tls_error_t *);
+
+/**
+ * @brief 在整轮保护下共享一次等待及TLS期限扫描，保持原FIFO不撤取
+ * @param[in,out] server 非空根，调用者已核队列并设置scheduling_active。
+ * @param[in,out] progress 非空已初始化原poll事实，effective_timeout已计划。
+ * @param[out] listener_events 可空窗口输出，沿原poll规则。
+ * @param[in,out] tls_report TLS模式非空局部时间报告，RAW为NULL。
+ * @param[out] tls_error TLS模式非空原因，RAW为NULL。
+ * @return 原扫描/采时/wait/停止/队列分类，不执行客户阶段。
+ * @note 不取得owner或撤取待办，不撤销外层保护；部分到期入队保持，外层恢复errno。
+ */
+static vireo_result_t ready_wait(vireo_tcp_server_t *server,
+    vireo_tcp_server_poll_report_t *progress, uint32_t *listener_events,
+    vireo_tcp_server_tls_poll_report_t *tls_report, vireo_tcp_server_tls_error_t *tls_error)
+{
+    bool wait_succeeded = false;
+    vireo_result_t result = VIREO_OK;
+    server->queue_fault = false;
+    if (tls_report != NULL) {
+        result = tls_scan(server, false, 0, tls_report, tls_error);
+        if (result != VIREO_OK) goto waited;
+        tls_error->stage = VIREO_TCP_SERVER_TLS_CLOCK;
+        result = server->tls_ops.now(server->tls_ops.context, &tls_report->before_wait_ns,
+            &tls_error->clock_error);
+        if (result != VIREO_OK) goto waited;
+        if (tls_report->has_deadline) {
+            tls_error->stage = VIREO_TCP_SERVER_TLS_DEADLINE;
+            result = vireo_clock_deadline_wait_ms(tls_report->before_wait_ns,
+                tls_report->nearest_deadline_ns, progress->effective_timeout_ms,
+                &progress->effective_timeout_ms);
+            if (result != VIREO_OK) goto waited;
+        }
+        tls_error->stage = VIREO_TCP_SERVER_TLS_WAIT;
+    }
+    progress->stage = VIREO_TCP_SERVER_POLL_WAIT;
+    progress->wait_called = true;
+    if (listener_events != NULL) {
+        server->listener_poll_events = 0;
+        server->listener_poll_active = true;
+    }
+    result = server->scheduler_ops.run_once(server->scheduler_ops.context, server->loop,
+        progress->effective_timeout_ms, &progress->wait, &progress->loop_error);
+    if (listener_events != NULL) {
+        server->listener_poll_active = false;
+        if (result == VIREO_OK) *listener_events = server->listener_poll_events;
+        server->listener_poll_events = 0;
+    }
+    if (result != VIREO_OK) {
+        if (tls_error != NULL) tls_error->loop_error = progress->loop_error;
+        goto waited;
+    }
+    wait_succeeded = true;
+    progress->queued_after_wait = server->queue_count;
+    if (tls_report != NULL) {
+        tls_error->stage = VIREO_TCP_SERVER_TLS_CLOCK;
+        result = server->tls_ops.now(server->tls_ops.context, &tls_report->after_wait_ns,
+            &tls_error->clock_error);
+        if (result != VIREO_OK) goto waited;
+        result = tls_scan(server, true, tls_report->after_wait_ns, tls_report, tls_error);
+        if (result != VIREO_OK) goto waited;
+        result = stop_snapshot(server, &progress->stopped);
+        if (result != VIREO_OK || progress->stopped) goto waited;
+        tls_error->stage = VIREO_TCP_SERVER_TLS_QUEUE;
+    }
+    progress->queued_after_wait = server->queue_count;
+    progress->stage = VIREO_TCP_SERVER_POLL_QUEUE;
+    if (server->queue_fault || !queue_valid(server)) {
+        result = VIREO_RESULT_INTERNAL;
+        goto waited;
+    }
+waited:
+    if (wait_succeeded) progress->queued_after_wait = server->queue_count;
+    progress->remaining_count = server->queue_count;
+    return result;
+}
+
+/**
  * @brief
  *     公共机械等待及本核心取出前故障门的共同实现。
  *
@@ -3355,6 +3462,10 @@ vireo_result_t vireo_tcp_server_close_batch(vireo_tcp_server_t *server,
  *     gate 的可空短借用 context，不保存。
  * @param[out] listener_events
  *     可空独立局部事件值；NULL关闭新采集，非空仅成功wait后发布本次OR。
+ * @param[in,out] tls_report
+ *     NULL为旧RAW机械等待，非空为TLS同FIFO前后扫描及时间报告；与模式必须相符。
+ * @param[in,out] tls_error
+ *     TLS路径非空独立局部原因，保存扫描/采时/等待失败；RAW路径为NULL。
  *
  * @return
  *     原 poll 分类；失败保留真实取出前缀和未取队列。
@@ -3365,7 +3476,8 @@ vireo_result_t vireo_tcp_server_close_batch(vireo_tcp_server_t *server,
 static vireo_result_t poll_ready(vireo_tcp_server_t *server, int timeout_ms,
     size_t max_clients, vireo_tcp_server_ready_client_t *out_clients, size_t client_capacity,
     vireo_tcp_server_poll_report_t *report, vireo_tcp_server_poll_queue_gate_t gate, void *context,
-    uint32_t *listener_events)
+    uint32_t *listener_events, vireo_tcp_server_tls_poll_report_t *tls_report,
+    vireo_tcp_server_tls_error_t *tls_error)
 {
     int const saved = errno;
     vireo_tcp_server_poll_report_t progress = {0};
@@ -3379,6 +3491,12 @@ static vireo_result_t poll_ready(vireo_tcp_server_t *server, int timeout_ms,
         goto finish;
     }
     progress.stage = VIREO_TCP_SERVER_POLL_CHECK_SERVER;
+    if ((server->owned_tls_context != NULL) != (tls_report != NULL)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    if (tls_report != NULL && (!server->listener_bound || server->listener == NULL)) {
+        result = VIREO_RESULT_NOT_FOUND; goto finish;
+    }
     if (server->closing_active || server->shutdown_active || server->processing_active ||
         server->driving_active || server->scheduling_active || server->serving_active ||
         server->running_active) {
@@ -3397,27 +3515,8 @@ static vireo_result_t poll_ready(vireo_tcp_server_t *server, int timeout_ms,
     if (result != VIREO_OK || progress.stopped) goto finish;
     progress.effective_timeout_ms = server->queue_count != 0 ? 0 : timeout_ms;
     server->scheduling_active = true;
-    server->queue_fault = false;
-    progress.stage = VIREO_TCP_SERVER_POLL_WAIT;
-    progress.wait_called = true;
-    if (listener_events != NULL) {
-        server->listener_poll_events = 0;
-        server->listener_poll_active = true;
-    }
-    result = server->scheduler_ops.run_once(server->scheduler_ops.context, server->loop,
-        progress.effective_timeout_ms, &progress.wait, &progress.loop_error);
-    if (listener_events != NULL) {
-        server->listener_poll_active = false;
-        if (result == VIREO_OK) *listener_events = server->listener_poll_events;
-        server->listener_poll_events = 0;
-    }
-    if (result != VIREO_OK) goto waited;
-    progress.queued_after_wait = server->queue_count;
-    progress.stage = VIREO_TCP_SERVER_POLL_QUEUE;
-    if (server->queue_fault || !queue_valid(server)) {
-        result = VIREO_RESULT_INTERNAL;
-        goto waited;
-    }
+    result = ready_wait(server, &progress, listener_events, tls_report, tls_error);
+    if (result != VIREO_OK || progress.stopped) goto waited;
     size_t count = progress.queued_after_wait;
     if (count > max_clients) count = max_clients;
     if (count > client_capacity) count = client_capacity;
@@ -3451,7 +3550,7 @@ vireo_result_t vireo_tcp_server_poll_ready_once(vireo_tcp_server_t *server, int 
     size_t max_clients, vireo_tcp_server_ready_client_t *out_clients, size_t client_capacity,
     vireo_tcp_server_poll_report_t *report)
 {
-    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, NULL, NULL, NULL);
+    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, NULL, NULL, NULL, NULL, NULL);
 }
 
 vireo_result_t vireo_tcp_server_poll_ready_once_with_gate(vireo_tcp_server_t *server,
@@ -3459,7 +3558,7 @@ vireo_result_t vireo_tcp_server_poll_ready_once_with_gate(vireo_tcp_server_t *se
     size_t client_capacity, vireo_tcp_server_poll_report_t *report,
     vireo_tcp_server_poll_queue_gate_t gate, void *context)
 {
-    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, gate, context, NULL);
+    return poll_ready(server, timeout_ms, max_clients, out_clients, client_capacity, report, gate, context, NULL, NULL, NULL);
 }
 
 /** 两字段局部报告独立于资源，NULL report仍走原基本拒绝，无窗口变更。 */
@@ -3470,7 +3569,7 @@ vireo_result_t vireo_tcp_server_poll_with_listener_once_with_gate(vireo_tcp_serv
 {
     vireo_tcp_server_listener_poll_report_t value = {0};
     vireo_result_t const result = poll_ready(server, timeout_ms, max_clients, out_clients,
-        client_capacity, report != NULL ? &value.poll : NULL, gate, context, &value.listener_events);
+        client_capacity, report != NULL ? &value.poll : NULL, gate, context, &value.listener_events, NULL, NULL);
     if (report != NULL) *report = value;
     return result;
 }
@@ -3482,3 +3581,2023 @@ vireo_result_t vireo_tcp_server_poll_with_listener_once(vireo_tcp_server_t *serv
     return vireo_tcp_server_poll_with_listener_once_with_gate(server, timeout_ms,
         max_clients, out_clients, client_capacity, report, NULL, NULL);
 }
+
+/* TLS扩展只组合公开依赖；状态/期限权威仍在同一个TLS对象。 */
+/**
+ * @brief 桥接公开单调采集，不在server保存第二时钟
+ *
+ * @param[in] ctx
+ *     系统桥接不用的上下文，可空。
+ * @param[out] now
+ *     非空独立纳秒输出，仅成功提交。
+ * @param[out] error
+ *     可空独立clock原因。
+ *
+ * @return
+ *     公开采集OK/IO/OVERFLOW/INTERNAL原样返回。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_now(void *ctx, vireo_monotonic_ns_t *now, vireo_clock_error_t *error)
+{ (void)ctx; return vireo_clock_monotonic_now(now, error); }
+/**
+ * @brief 桥接公开TLS connection创建，失败不转移fd
+ *
+ * @param[in] ctx
+ *     系统桥接不用的上下文，可空。
+ * @param[in] context
+ *     server拥有的context，仅短借。
+ * @param[in] options
+ *     固定单SSL包装预算，短借。
+ * @param[in,out] fd
+ *     非空唯一accepted fd owner，成功清为-1。
+ * @param[in,out] owner
+ *     非空独立NULL connection owner，成功接管。
+ * @param[out] error
+ *     可空独立connection原因。
+ *
+ * @return
+ *     公开创建分类原样返回；不执行握手或业务。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_create(void *ctx, vireo_tls_context_t const *context,
+    vireo_tls_connection_options_t const *options, int *fd, vireo_connection_t **owner,
+    vireo_connection_error_t *error)
+{ (void)ctx; return vireo_connection_create_tls_server(context, options, fd, owner, error); }
+/**
+ * @brief 桥接固定应用资源准备，不改TLS业务许可
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     当前未握手对象的串行短借，不转移owner。
+ * @param[in] options
+ *     固定八配置，短借至返回。
+ * @param[out] error
+ *     可空独立TLS原因。
+ *
+ * @return
+ *     公开prepare成功/失败分类，失败仍由connection清理。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_prepare(void *ctx, vireo_tls_connection_t *tls,
+    vireo_tls_io_options_t const *options, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_io_prepare(tls, options, error); }
+/**
+ * @brief 桥接一次期限装载，不额外采时或续期
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     当前INITIAL对象短借。
+ * @param[in] now
+ *     成功accept后采得的同域纳秒值。
+ * @param[in] due
+ *     受检求得的同域绝对期限。
+ * @param[out] error
+ *     可空独立TLS原因。
+ *
+ * @return
+ *     公开arm原分类，失败不转移owner。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_arm(void *ctx, vireo_tls_connection_t *tls,
+    vireo_monotonic_ns_t now, vireo_monotonic_ns_t due, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_handshake_deadline_arm(tls, now, due, error); }
+/**
+ * @brief 桥接真实TLS握手快照，避免server复制状态
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in] tls
+ *     同Reactor短借，不得跨release使用。
+ * @param[out] info
+ *     非空独立快照，失败保持。
+ * @param[out] error
+ *     可空独立TLS原因。
+ *
+ * @return
+ *     公开inspect原分类，无网络或状态推进。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_inspect(void *ctx, vireo_tls_connection_t const *tls,
+    vireo_tls_connection_info_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_inspect(tls, info, error); }
+/**
+ * @brief 桥接原TLS期限观察，不保存第二份due
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in] tls
+ *     当前客户TLS短借。
+ * @param[out] info
+ *     非空独立期限快照，失败保持。
+ * @param[out] error
+ *     可空独立TLS原因。
+ *
+ * @return
+ *     公开deadline inspect原分类，不采时或修改期限。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_deadline(void *ctx, vireo_tls_connection_t const *tls,
+    vireo_tls_handshake_deadline_info_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_handshake_deadline_inspect(tls, info, error); }
+/**
+ * @brief 桥接原TLS带时间单步，真实原生次数仍由TLS限制
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     同Reactor当前客户TLS短借。
+ * @param[in] now
+ *     当前入口新采得的同域纳秒值。
+ * @param[out] info
+ *     非空独立握手报告，原生前拒绝保持。
+ * @param[out] error
+ *     可空独立TLS首因。
+ *
+ * @return
+ *     公开step_at原分类，WANT或终态事实由info决定。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_system_step(void *ctx, vireo_tls_connection_t *tls,
+    vireo_monotonic_ns_t now, vireo_tls_handshake_info_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_handshake_step_at(tls, now, info, error); }
+
+/**
+ * @brief 桥接真实应用快照，不复制长期TLS状态
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in] tls
+ *     当前短借对象，存活至返回。
+ * @param[out] info
+ *     必需独立快照，成功提交。
+ * @param[out] error
+ *     可空独立TLS诊断。
+ *
+ * @return
+ *     原公开分类。
+ *
+ * @note 无网络或owner交接，errno沿原依赖，最外层统一恢复。
+ */
+static vireo_result_t tls_system_io_inspect(void *ctx, vireo_tls_connection_t const *tls,
+    vireo_tls_io_info_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_io_inspect(tls, info, error); }
+
+/**
+ * @brief 桥接纯TLS迟滞/关注建议，不自动MOD
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     当前短借对象，同Reactor串行。
+ * @param[out] info
+ *     必需独立flow，成功提交。
+ * @param[out] error
+ *     可空独立诊断。
+ *
+ * @return
+ *     原公开分类。
+ *
+ * @note 无owner交接/网络/等待，errno由最外层恢复。
+ */
+static vireo_result_t tls_system_flow(void *ctx, vireo_tls_connection_t *tls,
+    vireo_tls_io_flow_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_flow_refresh(tls, info, error); }
+
+/**
+ * @brief 桥接单次有界TLS接收，保留原生前输出保持
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     当前短借对象，同Reactor串行。
+ * @param[in] budget
+ *     原明文字节/SSL次数预算，只借至返回。
+ * @param[out] info
+ *     必需独立进度，按原发布规则。
+ * @param[out] error
+ *     可空独立TLS诊断。
+ *
+ * @return
+ *     原公开分类，不替调用者重试。
+ *
+ * @note 沿原稳定请求/SIGPIPE/库队列规则，errno由最外层恢复，无owner交接。
+ */
+static vireo_result_t tls_system_receive(void *ctx, vireo_tls_connection_t *tls,
+    vireo_tls_io_budget_t const *budget, vireo_tls_io_progress_t *info,
+    vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_receive(tls, budget, info, error); }
+
+/**
+ * @brief 桥接单次有界TLS发送，不重领预算或改变locked请求
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in,out] tls
+ *     当前短借对象，同Reactor串行。
+ * @param[in] budget
+ *     原明文字节/SSL次数预算，只借至返回。
+ * @param[out] info
+ *     必需独立进度，按原发布规则。
+ * @param[out] error
+ *     可空独立TLS诊断。
+ *
+ * @return
+ *     原公开分类，不替调用者重试。
+ *
+ * @note 沿原稳定请求/SIGPIPE/库队列规则，errno由最外层恢复，无owner交接。
+ */
+static vireo_result_t tls_system_send(void *ctx, vireo_tls_connection_t *tls,
+    vireo_tls_io_budget_t const *budget, vireo_tls_io_progress_t *info,
+    vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_send(tls, budget, info, error); }
+
+/**
+ * @brief 桥接关闭快照，阻止应用driver绕过已请求关闭的门禁
+ *
+ * @param[in] ctx
+ *     不用的上下文，可空。
+ * @param[in] tls
+ *     当前短借对象，存活至返回。
+ * @param[out] info
+ *     必需独立关闭快照，成功提交。
+ * @param[out] error
+ *     可空独立TLS诊断。
+ *
+ * @return
+ *     原公开分类。
+ *
+ * @note 无网络/采时/owner交接，errno由最外层恢复。
+ */
+static vireo_result_t tls_system_close_inspect(void *ctx, vireo_tls_connection_t const *tls,
+    vireo_tls_close_info_t *info, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_close_inspect(tls, info, error); }
+
+/**
+ * @brief 桥接原关闭请求，仅成功时封口。
+ * @param[in] ctx 不用的短借上下文。
+ * @param[in,out] tls 同Reactor存活对象短借。
+ * @param[in] now 同域本次采时。
+ * @param[in] due checked后的固定期限。
+ * @param[out] error 可空独立TLS原因。
+ * @return 原公开分类，无网络/owner交接，外层恢复errno。
+ */
+static vireo_result_t tls_system_close_request(void *ctx, vireo_tls_connection_t *tls,
+    vireo_monotonic_ns_t now, vireo_monotonic_ns_t due, vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_close_request(tls, now, due, error); }
+/**
+ * @brief 桥接原关闭单步，不额外重试。
+ * @param[in] ctx 不用的短借上下文。
+ * @param[in,out] tls 同Reactor存活对象短借。
+ * @param[in] now 同域新采时，终态忽略。
+ * @param[in] bytes 已核正字节预算。
+ * @param[out] info 必需独立报告，原生前拒绝保持。
+ * @param[out] error 可空独立TLS原因。
+ * @return 原公开分类，至多一次native，无owner交接，外层恢复errno。
+ */
+static vireo_result_t tls_system_close_step_at(void *ctx, vireo_tls_connection_t *tls,
+    vireo_monotonic_ns_t now, size_t bytes, vireo_tls_close_progress_t *info,
+    vireo_tls_connection_error_t *error)
+{ (void)ctx; return vireo_tls_connection_close_step_at(tls, now, bytes, info, error); }
+
+static vireo_tcp_server_tls_ops_t const system_tls_ops = {
+    NULL, tls_system_now, tls_system_create, tls_system_prepare, tls_system_arm,
+    tls_system_inspect, tls_system_deadline, tls_system_step, tls_system_io_inspect,
+    tls_system_flow, tls_system_receive, tls_system_send, tls_system_close_inspect,
+    tls_system_close_request, tls_system_close_step_at
+};
+
+/** 完整表验证不执行依赖；无全局可变hooks或外模块private访问。 */
+static bool tls_ops_valid(vireo_tcp_server_tls_ops_t const *o)
+{
+    return o != NULL && o->now != NULL && o->create != NULL && o->prepare != NULL &&
+        o->arm != NULL && o->inspect != NULL && o->deadline != NULL && o->step != NULL &&
+        o->io_inspect != NULL && o->flow_refresh != NULL && o->receive != NULL &&
+        o->send != NULL && o->close_inspect != NULL &&
+        o->close_request != NULL && o->close_step_at != NULL;
+}
+
+/**
+ * @brief 覆盖独立诊断并恢复最外层errno
+ *
+ * @param[in] result
+ *     已有主要分类，不由次因改写。
+ * @param[in] detail
+ *     非空完整初始化的局部主因及次因。
+ * @param[out] error
+ *     可空独立诊断，非空时覆盖。
+ * @param[in] saved_errno
+ *     公共入口保存的原errno。
+ *
+ * @return
+ *     原result不变。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_finish(vireo_result_t result, vireo_tcp_server_tls_error_t const *detail,
+    vireo_tcp_server_tls_error_t *error, int saved_errno)
+{
+    if (error != NULL) *error = *detail;
+    errno = saved_errno;
+    return result;
+}
+
+/**
+ * @brief 在accept前固定八配置及两份容量口径
+ *
+ * @param[in] base
+ *     非空原server配置，仅借用。
+ * @param[in] o
+ *     非空TLS固定选项，仅借用。
+ * @param[out] pair
+ *     非空局部受检两FIFO和，失败值不发布给caller。
+ * @param[out] total
+ *     非空局部四固定区和，失败值不发布给caller。
+ *
+ * @return
+ *     OK表示数值合法；INVALID_ARGUMENT/RANGE/OVERFLOW区分正值、原prepare范围和算术拒绝。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_options_validate(vireo_tcp_server_options_t const *base,
+    vireo_tcp_server_tls_options_t const *o, size_t *pair, size_t *total)
+{
+    vireo_tls_io_options_t const *i = &o->io;
+    vireo_result_t result = vireo_checked_size_add(i->read_capacity, i->write_capacity, pair);
+    if (result == VIREO_OK)
+        result = vireo_checked_size_add(*pair, 2 * VIREO_TLS_IO_SCRATCH_BYTES, total);
+    if (result != VIREO_OK) return result;
+    if (o->max_wrapper_bytes == 0 || o->handshake_timeout_ns == 0 || o->max_tls_resource_bytes == 0)
+        return VIREO_RESULT_INVALID_ARGUMENT;
+    if (i->max_buffer_bytes == 0 || i->read_capacity == 0 || i->write_capacity == 0 ||
+        i->max_read_unit_bytes == 0 || i->read_low >= i->read_high || i->write_low >= i->write_high)
+        return VIREO_RESULT_RANGE;
+    if (o->max_wrapper_bytes > VIREO_TLS_CONNECTION_MAX_WRAPPER_BYTES ||
+        o->max_tls_resource_bytes > VIREO_TLS_IO_MAX_BUFFER_BYTES ||
+        i->read_capacity < VIREO_PROTOCOL_HEADER_SIZE || i->write_capacity < VIREO_PROTOCOL_HEADER_SIZE ||
+        i->max_read_unit_bytes < VIREO_PROTOCOL_HEADER_SIZE ||
+        i->max_read_unit_bytes > i->read_capacity || i->read_low < i->max_read_unit_bytes - 1 ||
+        i->read_high > i->read_capacity || i->write_high > i->write_capacity ||
+        i->max_buffer_bytes > VIREO_TLS_IO_MAX_BUFFER_BYTES || *total > i->max_buffer_bytes ||
+        *total > o->max_tls_resource_bytes || *pair > base->max_buffer_bytes)
+        return VIREO_RESULT_RANGE;
+    return VIREO_OK;
+}
+
+/** 旧零容量与新正容量共享同一根构造，context只在最后成功点move。 */
+static vireo_result_t create_tls_with_dependencies(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, size_t auxiliary_capacity,
+    vireo_tls_context_t **context_owner,
+    vireo_tcp_server_ops_t const *base_ops, vireo_tcp_server_listener_ops_t const *listener_ops,
+    vireo_tcp_server_client_ops_t const *client_ops,
+    vireo_tcp_server_scheduler_ops_t const *scheduler_ops, vireo_tcp_server_tls_ops_t const *tls_ops,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t detail = {0};
+    vireo_tcp_server_tls_ops_t const *o = tls_ops != NULL ? tls_ops : &system_tls_ops;
+    if (options == NULL || tls_options == NULL || context_owner == NULL || *context_owner == NULL ||
+        out_server == NULL || *out_server != NULL || !tls_ops_valid(o))
+        return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    size_t pair = 0, total = 0;
+    vireo_result_t result = tls_options_validate(options, tls_options, &pair, &total);
+    if (result != VIREO_OK) return tls_finish(result, &detail, error, saved);
+    vireo_tls_context_info_t context_info = {0};
+    detail.stage = VIREO_TCP_SERVER_TLS_CONTEXT;
+    result = vireo_tls_context_inspect(*context_owner, &context_info, &detail.context_error);
+    if (result != VIREO_OK) return tls_finish(result, &detail, error, saved);
+    if (options->max_memory_bytes > VIREO_TCP_SERVER_MAX_MEMORY ||
+        options->max_memory_bytes <= context_info.wrapper_bytes)
+        return tls_finish(VIREO_RESULT_RANGE, &detail, error, saved);
+    /* 原构造只看到扣除context预留后的预算；其真实loop/pool上限保持该值。 */
+    vireo_tcp_server_options_t adjusted = *options;
+    adjusted.max_memory_bytes -= context_info.wrapper_bytes;
+    vireo_tcp_server_t *candidate = NULL;
+    detail.stage = VIREO_TCP_SERVER_TLS_CREATE_SERVER;
+    result = create_with_dependencies(&adjusted, auxiliary_capacity, base_ops != NULL ? base_ops : &system_ops,
+        listener_ops != NULL ? listener_ops : &system_listener_ops, client_ops != NULL ? client_ops : &system_client_ops,
+        scheduler_ops != NULL ? scheduler_ops : &system_scheduler_ops, &system_stop_ops,
+        &candidate, &detail.server_error);
+    if (result != VIREO_OK) return tls_finish(result, &detail, error, saved);
+    candidate->options = *options;
+    candidate->tls_options = *tls_options;
+    candidate->context_wrapper_bytes = context_info.wrapper_bytes;
+    candidate->tls_pair_bytes = pair;
+    candidate->tls_per_connection_bytes = total;
+    candidate->tls_ops = *o;
+    candidate->owned_tls_context = *context_owner;
+    *context_owner = NULL;
+    *out_server = candidate;
+    detail = (vireo_tcp_server_tls_error_t){0};
+    return tls_finish(VIREO_OK, &detail, error, saved);
+}
+
+vireo_result_t vireo_tcp_server_create_tls_with_all_ops(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, vireo_tls_context_t **context_owner,
+    vireo_tcp_server_ops_t const *base_ops, vireo_tcp_server_listener_ops_t const *listener_ops,
+    vireo_tcp_server_client_ops_t const *client_ops,
+    vireo_tcp_server_scheduler_ops_t const *scheduler_ops, vireo_tcp_server_tls_ops_t const *tls_ops,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{
+    return create_tls_with_dependencies(options, tls_options, 0, context_owner, base_ops,
+        listener_ops, client_ops, scheduler_ops, tls_ops, out_server, error);
+}
+
+vireo_result_t vireo_tcp_server_create_tls_with_auxiliary_ops(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, size_t auxiliary_capacity,
+    vireo_tls_context_t **context_owner, vireo_tcp_server_ops_t const *base_ops,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t const detail = {0};
+    if (auxiliary_capacity == 0)
+        return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    return create_tls_with_dependencies(options, tls_options, auxiliary_capacity, context_owner,
+        base_ops, NULL, NULL, NULL, NULL, out_server, error);
+}
+
+vireo_result_t vireo_tcp_server_create_tls_with_auxiliary_capacity(
+    vireo_tcp_server_options_t const *options, vireo_tcp_server_tls_options_t const *tls_options,
+    size_t auxiliary_capacity, vireo_tls_context_t **context_owner,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{
+    return vireo_tcp_server_create_tls_with_auxiliary_ops(options, tls_options, auxiliary_capacity,
+        context_owner, NULL, out_server, error);
+}
+
+vireo_result_t vireo_tcp_server_create_tls_with_ops(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, vireo_tls_context_t **context_owner,
+    vireo_tcp_server_ops_t const *base_ops, vireo_tcp_server_client_ops_t const *client_ops,
+    vireo_tcp_server_scheduler_ops_t const *scheduler_ops, vireo_tcp_server_tls_ops_t const *tls_ops,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{ return vireo_tcp_server_create_tls_with_all_ops(options, tls_options, context_owner,
+    base_ops, NULL, client_ops, scheduler_ops, tls_ops, out_server, error); }
+
+vireo_result_t vireo_tcp_server_create_tls(vireo_tcp_server_options_t const *options,
+    vireo_tcp_server_tls_options_t const *tls_options, vireo_tls_context_t **context_owner,
+    vireo_tcp_server_t **out_server, vireo_tcp_server_tls_error_t *error)
+{
+    return vireo_tcp_server_create_tls_with_ops(options, tls_options, context_owner,
+        NULL, NULL, NULL, NULL, out_server, error);
+}
+
+vireo_result_t vireo_tcp_server_tls_inspect(vireo_tcp_server_t const *server,
+    vireo_tcp_server_tls_info_t *out_info, vireo_tcp_server_tls_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t detail = {0};
+    if (server == NULL || out_info == NULL)
+        return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    if (server->owned_tls_context == NULL)
+        return tls_finish(VIREO_RESULT_BUSY, &detail, error, saved);
+    detail.stage = VIREO_TCP_SERVER_TLS_INSPECT;
+    vireo_tcp_server_info_t base;
+    vireo_result_t result = vireo_tcp_server_inspect(server, &base);
+    size_t bytes = 0;
+    if (result == VIREO_OK)
+        result = vireo_checked_size_mul(base.connection_count, server->tls_per_connection_bytes, &bytes);
+    if (result != VIREO_OK) return tls_finish(result, &detail, error, saved);
+    if (bytes > server->tls_options.max_tls_resource_bytes)
+        return tls_finish(VIREO_RESULT_INTERNAL, &detail, error, saved);
+    *out_info = (vireo_tcp_server_tls_info_t){server->tls_options, server->tls_per_connection_bytes,
+        bytes, server->tls_options.max_tls_resource_bytes - bytes, server->context_wrapper_bytes};
+    detail = (vireo_tcp_server_tls_error_t){0};
+    return tls_finish(VIREO_OK, &detail, error, saved);
+}
+
+/**
+ * @brief 经原pool完整租约和server槽核对后短借TLS
+ *
+ * @param[in] server
+ *     非空同Reactor资源根，不获取第二owner。
+ * @param[in] client
+ *     完整数值身份，不保活。
+ * @param[out] connection
+ *     非空独立局部短借输出，仅本次使用。
+ * @param[out] tls
+ *     非空独立局部短借输出，不跨release。
+ * @param[in,out] detail
+ *     非空本次诊断，只记lookup失败阶段。
+ *
+ * @return
+ *     原lookup/borrow分类，无网络/资源消费。
+ *
+ * @note 无额外owner/重试或跨线程权限；系统桥接沿原依赖errno/库队列合同，外层恢复errno。
+ */
+static vireo_result_t tls_lookup(vireo_tcp_server_t const *server,
+    vireo_connection_pool_lease_t client, vireo_connection_t **connection,
+    vireo_tls_connection_t **tls, vireo_tcp_server_tls_error_t *detail)
+{
+    detail->stage = VIREO_TCP_SERVER_TLS_LOOKUP;
+    vireo_result_t result = find_client(server, client, connection);
+    if (result == VIREO_OK) result = vireo_connection_tls_borrow(*connection, tls);
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_client_tls_borrow(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tls_connection_t **out_tls,
+    vireo_tcp_server_tls_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t detail = {0};
+    if (server == NULL || out_tls == NULL)
+        return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    if (server->owned_tls_context == NULL || auxiliary_active(server) || server->running_active)
+        return tls_finish(VIREO_RESULT_BUSY, &detail, error, saved);
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_result_t const result = tls_lookup(server, client, &connection, &tls, &detail);
+    if (result == VIREO_OK) { *out_tls = tls; detail = (vireo_tcp_server_tls_error_t){0}; }
+    return tls_finish(result, &detail, error, saved);
+}
+
+/**
+ * @brief 复用原TLS接入事务；嵌套serve保留其serving保护
+ * @param[in,out] server 存活TLS根，只有可信serve可已持serving。
+ * @param[in] budget 原独立正接入数量/调用预算，不保留地址。
+ * @param[in,out] out_clients 原独立空租约潜在前缀，只发布admitted项。
+ * @param[in] capacity 原数组正元素数，参与条数上限。
+ * @param[out] out_info 原报告，前置拒绝保持，合法执行发布真实进度。
+ * @param[out] error 原可空完整主因/首清理诊断。
+ * @param[in] from_serve 仅本核心已保护的serve为true，公共wrapper恒false。
+ * @param[in] gate 可空发布后只读排队故障门，失败不改变owner/状态。
+ * @param[in,out] gate_context gate调用期短借，不保存。
+ * @return 原admit或gate分类，任何错误都不撤回已发布lease。
+ * @note 不放宽调度/业务在途，处理原owner清理；外层恢复errno。
+ */
+static vireo_result_t tls_admit_batch(vireo_tcp_server_t *server,
+    vireo_tcp_server_admit_budget_t const *budget, vireo_connection_pool_lease_t *out_clients,
+    size_t capacity, vireo_tcp_server_tls_admit_info_t *out_info, vireo_tcp_server_tls_error_t *error,
+    bool from_serve, vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t detail = {0};
+    if (server == NULL || budget == NULL || out_clients == NULL || out_info == NULL ||
+        budget->max_accepts == 0 || budget->max_accept_syscalls == 0)
+        return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    if (server->owned_tls_context == NULL || server->closing_active || server->shutdown_active ||
+        server->processing_active || server->driving_active || server->scheduling_active ||
+        (server->serving_active && !from_serve) || server->running_active)
+        return tls_finish(VIREO_RESULT_BUSY, &detail, error, saved);
+    if (capacity == 0 || capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        budget->max_accepts > VIREO_TCP_SERVER_MAX_CONNECTIONS)
+        return tls_finish(VIREO_RESULT_RANGE, &detail, error, saved);
+    size_t const limit = capacity < budget->max_accepts ? capacity : budget->max_accepts;
+    for (size_t k = 0; k < limit; ++k)
+        if (!lease_empty(out_clients[k]))
+            return tls_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved);
+    if (server->listener == NULL)
+        return tls_finish(VIREO_RESULT_NOT_FOUND, &detail, error, saved);
+    vireo_tcp_server_tls_info_t resources;
+    vireo_result_t result = vireo_tcp_server_tls_inspect(server, &resources, &detail);
+    if (result != VIREO_OK) return tls_finish(result, &detail, error, saved);
+    vireo_tcp_server_tls_admit_info_t progress = {0};
+    vireo_tcp_server_admit_info_t *p = &progress.admission;
+    vireo_tcp_server_client_ops_t const *c = &server->client_ops;
+    vireo_tcp_server_tls_ops_t const *t = &server->tls_ops;
+    if (!from_serve) server->serving_active = true; /* 嵌套调用不撤除外层整段保护。 */
+    for (;;) {
+        if (p->accepted_count == limit) { p->stop_reason = VIREO_TCP_SERVER_ADMIT_BATCH_LIMIT; break; }
+        if (server->client_count == server->options.connection_capacity) {
+            p->stop_reason = VIREO_TCP_SERVER_ADMIT_CONNECTION_LIMIT; break;
+        }
+        if (server->tls_pair_bytes > server->options.max_buffer_bytes - server->buffer_bytes) {
+            p->stop_reason = VIREO_TCP_SERVER_ADMIT_BUFFER_LIMIT; break;
+        }
+        if (server->tls_per_connection_bytes > resources.available_resource_bytes) {
+            progress.tls_resource_limited = true;
+            p->stop_reason = VIREO_TCP_SERVER_ADMIT_BUFFER_LIMIT; break;
+        }
+        if (p->accept_calls == budget->max_accept_syscalls) {
+            p->stop_reason = VIREO_TCP_SERVER_ADMIT_CALL_LIMIT; break;
+        }
+        vireo_acceptor_accept_budget_t const allowance = {1, budget->max_accept_syscalls - p->accept_calls};
+        vireo_acceptor_accept_info_t accepted = {0};
+        int fd = -1;
+        vireo_connection_t *connection = NULL, *borrowed = NULL;
+        vireo_tls_connection_t *tls = NULL;
+        vireo_connection_pool_lease_t lease = {0};
+        client_slot_t *slot = NULL;
+        detail.stage = VIREO_TCP_SERVER_TLS_ACCEPT;
+        detail.client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_ACCEPT;
+        result = c->accept(c->context, server->listener, &allowance, &fd, 1, &accepted,
+            &detail.client_error.primary.acceptor_error);
+        if (accepted.accepted_count > 1 || accepted.accept_calls > allowance.max_syscalls ||
+            accepted.transient_errors > accepted.accept_calls || accepted.accepted_count > accepted.accept_calls ||
+            (accepted.accepted_count == 1) != (fd >= 0) ||
+            vireo_checked_size_add(p->accept_calls, accepted.accept_calls, &p->accept_calls) != VIREO_OK ||
+            vireo_checked_size_add(p->transient_errors, accepted.transient_errors, &p->transient_errors) != VIREO_OK) {
+            result = VIREO_RESULT_INTERNAL; goto rejected;
+        }
+        p->accepted_count += accepted.accepted_count;
+        if (result != VIREO_OK) goto rejected;
+        if (fd < 0) {
+            if (accepted.stop_reason == VIREO_ACCEPTOR_ACCEPT_WOULD_BLOCK)
+                p->stop_reason = VIREO_TCP_SERVER_ADMIT_WOULD_BLOCK;
+            else if (accepted.stop_reason == VIREO_ACCEPTOR_ACCEPT_CALL_BUDGET &&
+                p->accept_calls == budget->max_accept_syscalls)
+                p->stop_reason = VIREO_TCP_SERVER_ADMIT_CALL_LIMIT;
+            else { result = VIREO_RESULT_INTERNAL; goto rejected; }
+            detail = (vireo_tcp_server_tls_error_t){0}; break;
+        }
+        vireo_monotonic_ns_t now = 0, due = 0;
+        detail.stage = VIREO_TCP_SERVER_TLS_CLOCK;
+        detail.client_error.primary = (vireo_tcp_server_client_cause_t){0};
+        result = t->now(t->context, &now, &detail.clock_error);
+        if (result != VIREO_OK) goto rejected;
+        detail.stage = VIREO_TCP_SERVER_TLS_DEADLINE;
+        result = vireo_clock_deadline_after(now, server->tls_options.handshake_timeout_ns, &due);
+        if (result != VIREO_OK) goto rejected;
+        detail.stage = VIREO_TCP_SERVER_TLS_CREATE_CLIENT;
+        detail.client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_CREATE;
+        vireo_tls_connection_options_t const wrapper = {server->tls_options.max_wrapper_bytes};
+        result = t->create(t->context, server->owned_tls_context, &wrapper, &fd, &connection,
+            &detail.client_error.primary.connection_error);
+        if (result != VIREO_OK) goto rejected;
+        detail.client_error.primary = (vireo_tcp_server_client_cause_t){0};
+        detail.stage = VIREO_TCP_SERVER_TLS_LOOKUP;
+        result = vireo_connection_tls_borrow(connection, &tls);
+        if (result != VIREO_OK) goto rejected;
+        detail.stage = VIREO_TCP_SERVER_TLS_PREPARE;
+        result = t->prepare(t->context, tls, &server->tls_options.io, &detail.tls_error);
+        if (result != VIREO_OK) goto rejected;
+        detail.stage = VIREO_TCP_SERVER_TLS_ARM;
+        result = t->arm(t->context, tls, now, due, &detail.tls_error);
+        if (result != VIREO_OK) goto rejected;
+        detail.stage = VIREO_TCP_SERVER_TLS_ADOPT;
+        detail.client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_ADOPT;
+        result = c->adopt(c->context, server->pool, &connection, &lease, &detail.client_error.primary.pool_error);
+        if (result != VIREO_OK) goto rejected;
+        if (lease_empty(lease) || lease.slot_index >= server->options.connection_capacity) {
+            result = VIREO_RESULT_INTERNAL; goto rejected;
+        }
+        detail.stage = VIREO_TCP_SERVER_TLS_LOOKUP;
+        detail.client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_LOOKUP;
+        result = c->lookup(c->context, server->pool, lease, &borrowed);
+        if (result != VIREO_OK) goto rejected;
+        if (borrowed == NULL) { result = VIREO_RESULT_INTERNAL; goto rejected; }
+        slot = &server->clients[lease.slot_index];
+        if (slot->live) { result = VIREO_RESULT_INTERNAL; goto rejected; }
+        *slot = (client_slot_t){.lease = lease, .buffer_bytes = server->tls_pair_bytes, .parent = server,
+            .queue_prev = SIZE_MAX, .queue_next = SIZE_MAX};
+        detail.stage = VIREO_TCP_SERVER_TLS_ATTACH;
+        detail.client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_ATTACH;
+        result = c->attach(c->context, borrowed, server->loop,
+            VIREO_EPOLL_INTEREST_READ | VIREO_EPOLL_INTEREST_PEER_WRITE_CLOSED,
+            client_observed, slot, &detail.client_error.primary.loop_error);
+        if (result != VIREO_OK) goto rejected;
+        /* ADD后先发布owner可达性和真实账；下面无申请的入队若遇坏链也不能隐藏客户。 */
+        slot->live = true; slot->bound = true;
+        ++server->client_count; ++server->registered_clients;
+        server->buffer_bytes += server->tls_pair_bytes;
+        resources.available_resource_bytes -= server->tls_per_connection_bytes;
+        out_clients[p->admitted_count++] = lease;
+        detail = (vireo_tcp_server_tls_error_t){.stage = VIREO_TCP_SERVER_TLS_QUEUE};
+        result = gate != NULL ? gate(gate_context, server, lease) : VIREO_OK;
+        if (result == VIREO_OK) result = queue_append(server, lease.slot_index);
+        if (result != VIREO_OK) { p->stop_reason = VIREO_TCP_SERVER_ADMIT_ERROR; break; }
+        detail = (vireo_tcp_server_tls_error_t){0};
+        continue;
+rejected:
+        p->rejected_count = p->accepted_count - p->admitted_count;
+        clean_pending(server, &fd, &connection, &lease, &detail.client_error);
+        if (slot != NULL && lease_empty(lease))
+            *slot = (client_slot_t){.parent = server, .queue_prev = SIZE_MAX, .queue_next = SIZE_MAX};
+        p->stop_reason = VIREO_TCP_SERVER_ADMIT_ERROR;
+        break;
+    }
+    if (!from_serve) server->serving_active = false;
+    *out_info = progress;
+    return tls_finish(result, &detail, error, saved);
+}
+
+vireo_result_t vireo_tcp_server_tls_admit_batch(vireo_tcp_server_t *server,
+    vireo_tcp_server_admit_budget_t const *budget, vireo_connection_pool_lease_t *out_clients,
+    size_t capacity, vireo_tcp_server_tls_admit_info_t *out_info, vireo_tcp_server_tls_error_t *error)
+{ return tls_admit_batch(server, budget, out_clients, capacity, out_info, error, false, NULL, NULL); }
+
+/** 两扫描共享同一代码；公开观察握手/活跃关闭的原due，不缓存裸指针或第二期限。 */
+static vireo_result_t tls_scan(vireo_tcp_server_t *server, bool enqueue,
+    vireo_monotonic_ns_t now, vireo_tcp_server_tls_poll_report_t *report,
+    vireo_tcp_server_tls_error_t *detail)
+{
+    vireo_tcp_server_tls_stage_t const stage = enqueue ? VIREO_TCP_SERVER_TLS_SCAN_AFTER :
+        VIREO_TCP_SERVER_TLS_SCAN_BEFORE;
+    detail->stage = stage;
+    for (size_t k = 0; k < server->options.connection_capacity; ++k) {
+        ++report->scanned_slots;
+        client_slot_t const *slot = &server->clients[k];
+        if (!slot->live) continue;
+        vireo_connection_t *connection = NULL;
+        vireo_tls_connection_t *tls = NULL;
+        vireo_result_t result = tls_lookup(server, slot->lease, &connection, &tls, detail);
+        detail->stage = stage;
+        if (result != VIREO_OK) return result;
+        vireo_tls_connection_info_t state = {0};
+        result = server->tls_ops.inspect(server->tls_ops.context, tls, &state, &detail->tls_error);
+        if (result != VIREO_OK) return result;
+        vireo_monotonic_ns_t due = 0;
+        if (state.handshake_state == VIREO_TLS_HANDSHAKE_ESTABLISHED) {
+            vireo_tls_close_info_t close = {0};
+            result = server->tls_ops.close_inspect(server->tls_ops.context, tls, &close,
+                &detail->tls_error);
+            if (result != VIREO_OK) return result;
+            if (close.state == VIREO_TLS_CLOSE_NONE || close.state == VIREO_TLS_CLOSE_COMPLETE ||
+                close.state == VIREO_TLS_CLOSE_FAILED) continue;
+            if (close.state < VIREO_TLS_CLOSE_DRAINING || close.state > VIREO_TLS_CLOSE_WAIT_PEER)
+                return VIREO_RESULT_INTERNAL;
+            due = close.deadline_ns;
+        } else {
+            if (state.handshake_state == VIREO_TLS_HANDSHAKE_FAILED) continue;
+            if (state.handshake_state != VIREO_TLS_HANDSHAKE_INITIAL &&
+                state.handshake_state != VIREO_TLS_HANDSHAKE_HANDSHAKING) return VIREO_RESULT_INTERNAL;
+            vireo_tls_handshake_deadline_info_t deadline = {0};
+            result = server->tls_ops.deadline(server->tls_ops.context, tls, &deadline, &detail->tls_error);
+            if (result != VIREO_OK) return result;
+            if (!deadline.armed) return VIREO_RESULT_INTERNAL;
+            due = deadline.deadline_ns;
+        }
+        if (!enqueue && (!report->has_deadline || due < report->nearest_deadline_ns)) {
+            report->has_deadline = true;
+            report->nearest_deadline_ns = due;
+        }
+        if (enqueue && now >= due) {
+            ++report->expired_clients;
+            result = queue_append(server, k);
+            if (result != VIREO_OK) return result;
+        }
+    }
+    return VIREO_OK;
+}
+
+/**
+ * @brief 检查TLS子阶段在途，可信客户轮仅可越过自身scheduling标记
+ * @param[in] server 非空存活根短借。
+ * @param[in] from_round 仅内部客户轮为true，公共wrapper恒false。
+ * @param[in] from_serve 仅可信服务嵌套允许自身serving标记，公共wrapper恒false。
+ * @return 存在不允许的在途时true，不修改状态。
+ * @note 保持driving/processing等全部保护，无临时撤标记或跨线程许可。
+ */
+static bool tls_stage_active(vireo_tcp_server_t const *server, bool from_round, bool from_serve)
+{
+    return server->closing_active || server->shutdown_active || server->processing_active ||
+        server->driving_active || (server->serving_active && !from_serve) || server->running_active ||
+        (server->scheduling_active && !from_round);
+}
+
+/**
+ * @brief 复用原握手单步，内部客户轮仅豁免自身调度标记
+ * @param[in,out] server 同Reactor存活TLS根，其他在途仍拒绝。
+ * @param[in] client 当前完整绑定租约。
+ * @param[out] out_info 非空独立握手/关注事实。
+ * @param[out] error 可空原完整主/次原因。
+ * @param[in] from_round 仅可信内部客户轮为true，公共入口false。
+ * @param[in] from_serve 仅原服务core可信调用可越过自身serving，其他保护保持。
+ * @return 原握手/观察/MOD分类，不回滚已建立状态。
+ * @note 原采时/一次native/首错/恢复合同保持，无owner交接；保持errno。
+ */
+static vireo_result_t tls_handshake_step(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_handshake_info_t *out_info,
+    vireo_tcp_server_tls_error_t *error, bool from_round, bool from_serve)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_error_t detail = {0};
+    vireo_tcp_server_tls_handshake_info_t progress = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL) goto finish;
+    if (server->owned_tls_context == NULL || tls_stage_active(server, from_round, from_serve)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    result = tls_lookup(server, client, &connection, &tls, &detail);
+    if (result != VIREO_OK) goto finish;
+    if (!server->clients[client.slot_index].bound) { result = VIREO_RESULT_NOT_FOUND; goto finish; }
+    server->driving_active = true;
+    detail.stage = VIREO_TCP_SERVER_TLS_INSPECT;
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, connection, &current);
+    if (result != VIREO_OK) goto driven;
+    progress.interests = current.loop_interests;
+    detail.stage = VIREO_TCP_SERVER_TLS_CLOCK;
+    result = server->tls_ops.now(server->tls_ops.context, &progress.now_ns, &detail.clock_error);
+    if (result != VIREO_OK) goto driven;
+    progress.sampled = true;
+    detail.stage = VIREO_TCP_SERVER_TLS_HANDSHAKE;
+    /* 非法枚举哨兵仅局部使用：原生前拒绝保持输出时，绝不能据全零误同步。 */
+    progress.handshake.state = (vireo_tls_handshake_state_t)-1;
+    progress.step_called = true;
+    result = server->tls_ops.step(server->tls_ops.context, tls, progress.now_ns,
+        &progress.handshake, &detail.tls_error);
+    if (progress.handshake.state == (vireo_tls_handshake_state_t)-1) {
+        progress.handshake = (vireo_tls_handshake_info_t){0}; goto driven;
+    }
+    progress.handshake_reported = true;
+    uint32_t desired = VIREO_EPOLL_INTEREST_PEER_WRITE_CLOSED;
+    if (progress.handshake.state == VIREO_TLS_HANDSHAKE_ESTABLISHED) {
+        desired |= VIREO_EPOLL_INTEREST_READ; progress.application_ready = true;
+    } else if (progress.handshake.state == VIREO_TLS_HANDSHAKE_FAILED) desired = 0;
+    else if (progress.handshake.state == VIREO_TLS_HANDSHAKE_HANDSHAKING &&
+        progress.handshake.wait == VIREO_TLS_HANDSHAKE_WAIT_READ) desired |= VIREO_EPOLL_INTEREST_READ;
+    else if (progress.handshake.state == VIREO_TLS_HANDSHAKE_HANDSHAKING &&
+        progress.handshake.wait == VIREO_TLS_HANDSHAKE_WAIT_WRITE) desired |= VIREO_EPOLL_INTEREST_WRITE;
+    else { result = VIREO_RESULT_INTERNAL; goto driven; }
+    if (desired != current.loop_interests) {
+        progress.sync_called = true;
+        detail.sync_result = server->client_ops.set_interests(server->client_ops.context,
+            connection, desired, &detail.sync_loop_error);
+        if (detail.sync_result == VIREO_OK) progress.interests = desired;
+        else {
+            detail.queue_result = queue_append(server, client.slot_index);
+            progress.retry_pending = detail.queue_result == VIREO_OK;
+            if (result == VIREO_OK) { result = detail.sync_result; detail.stage = VIREO_TCP_SERVER_TLS_SYNC; }
+        }
+    }
+driven:
+    server->driving_active = false;
+finish:
+    if (result == VIREO_OK) detail = (vireo_tcp_server_tls_error_t){0};
+    if (out_info != NULL) *out_info = progress;
+    return tls_finish(result, &detail, error, saved);
+}
+
+
+vireo_result_t vireo_tcp_server_client_tls_handshake_step(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_handshake_info_t *out_info,
+    vireo_tcp_server_tls_error_t *error)
+{ return tls_handshake_step(server, client, out_info, error, false, false); }
+
+vireo_result_t vireo_tcp_server_tls_poll_ready_once(vireo_tcp_server_t *server,
+    int timeout_ms, size_t max_clients, vireo_tcp_server_ready_client_t *out_clients,
+    size_t capacity, vireo_tcp_server_tls_poll_report_t *report, vireo_tcp_server_tls_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_poll_report_t progress = {0};
+    vireo_tcp_server_tls_error_t detail = {0};
+    vireo_result_t const result = poll_ready(server, timeout_ms, max_clients, out_clients, capacity,
+        report != NULL ? &progress.poll : NULL, NULL, NULL, &progress.listener_events, &progress, &detail);
+    if (result == VIREO_OK) detail = (vireo_tcp_server_tls_error_t){0};
+    if (report != NULL) *report = progress;
+    return tls_finish(result, &detail, error, saved);
+}
+
+/* 应用组合层只保存本轮值；没有第二份长期TLS状态、due或待办队列。 */
+/**
+ * @brief 统一提交应用诊断并恢复最外层errno
+ *
+ * @param[in] result
+ *     已选主要分类。
+ * @param[in] detail
+ *     必需完整初始化局部值。
+ * @param[out] error
+ *     可空独立输出，存在则覆盖。
+ * @param[in] saved
+ *     最外层入口errno。
+ *
+ * @return
+ *     result原样返回，不按次因覆盖。
+ *
+ * @note 不保存地址、分配或访问网络。
+ */
+static vireo_result_t tls_application_finish(vireo_result_t result,
+    vireo_tcp_server_tls_application_error_t const *detail,
+    vireo_tcp_server_tls_application_error_t *error, int saved)
+{
+    if (error != NULL) *error = *detail;
+    errno = saved;
+    return result;
+}
+
+/**
+ * @brief 核验当前绑定与真实TLS阶段，拒绝时不推进数据或修改关注
+ *
+ * @param[in] server
+ *     必需同Reactor资源根，调用者已检查无其他阶段在途。
+ * @param[in] client
+ *     当前完整数值租约。
+ * @param[out] connection
+ *     必需局部短借输出，不取得owner。
+ * @param[out] tls
+ *     必需局部短借输出，仅活至本轮返回。
+ * @param[out] io
+ *     必需独立应用状态/容量快照。
+ * @param[in,out] detail
+ *     必需本轮主诊断，失败保存阶段及依赖原因。
+ * @param[in] from_round
+ *     仅可信内部客户轮允许自身scheduling标记；其他保护保持。
+ * @param[in] from_serve
+ *     仅本核心serve嵌套允许自己的serving；公共调用恒false。
+ *
+ * @return
+ *     OK、原lookup/观察分类、模式/阶段BUSY或矛盾状态INTERNAL。
+ *
+ * @note 无网络/分配/MOD；TLS观察清库队列，errno由最外层恢复。
+ */
+static vireo_result_t tls_application_lookup(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_connection_t **connection,
+    vireo_tls_connection_t **tls, vireo_tls_io_info_t *io,
+    vireo_tcp_server_tls_application_error_t *detail, bool from_round, bool from_serve)
+{
+    if (server->owned_tls_context == NULL || tls_stage_active(server, from_round, from_serve))
+        return VIREO_RESULT_BUSY;
+    detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_LOOKUP;
+    detail->client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_LOOKUP;
+    vireo_result_t result = find_client(server, client, connection);
+    if (result != VIREO_OK) return result;
+    if (!server->clients[client.slot_index].bound) return VIREO_RESULT_NOT_FOUND;
+    result = vireo_connection_tls_borrow(*connection, tls);
+    if (result != VIREO_OK) return result;
+    detail->client_error = (vireo_tcp_server_client_error_t){0};
+    detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_INSPECT;
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    vireo_tls_connection_info_t handshake = {0};
+    result = ops->inspect(ops->context, *tls, &handshake, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (handshake.handshake_state != VIREO_TLS_HANDSHAKE_ESTABLISHED) {
+        if (handshake.handshake_state < VIREO_TLS_HANDSHAKE_INITIAL ||
+            handshake.handshake_state > VIREO_TLS_HANDSHAKE_FAILED) return VIREO_RESULT_INTERNAL;
+        detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_NONE;
+        return VIREO_RESULT_BUSY;
+    }
+    vireo_tls_close_info_t close_info = {0};
+    result = ops->close_inspect(ops->context, *tls, &close_info, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (close_info.state != VIREO_TLS_CLOSE_NONE) {
+        if (close_info.state < VIREO_TLS_CLOSE_NONE || close_info.state > VIREO_TLS_CLOSE_FAILED)
+            return VIREO_RESULT_INTERNAL;
+        detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_NONE;
+        return VIREO_RESULT_BUSY;
+    }
+    result = ops->io_inspect(ops->context, *tls, io, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (io->state == VIREO_TLS_IO_DISABLED || io->state == VIREO_TLS_IO_PREPARED) {
+        detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_NONE;
+        return VIREO_RESULT_BUSY;
+    }
+    if ((io->state != VIREO_TLS_IO_OPEN && io->state != VIREO_TLS_IO_FAILED) ||
+        io->read_size > io->options.read_capacity || io->write_size > io->options.write_capacity)
+        return VIREO_RESULT_INTERNAL;
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, *connection, &current);
+    if (result != VIREO_OK) return result;
+    if (!current.loop_attached) return VIREO_RESULT_NOT_FOUND;
+    detail->stage = VIREO_TCP_SERVER_TLS_APPLICATION_NONE;
+    return VIREO_OK;
+}
+
+/**
+ * @brief 按原处理停止原因判断一次保守缓存续探，NEED_MORE不会反复排队
+ *
+ * @param[in] process
+ *     可空成功处理报告；NULL表示没有允许续探的处理阶段。
+ * @param[in] io
+ *     必需真实最终应用快照。
+ * @param[in] response_limit
+ *     本轮最大响应帧，已经验证可容纳。
+ *
+ * @return
+ *     是否有已停止的缓存处理且写区余量足够再次保守尝试。
+ *
+ * @note 不peek/CRC检查预算后帧，不保证下一帧完整；无副作用。
+ */
+static bool tls_processing_pending(vireo_tcp_server_process_info_t const *process,
+    vireo_tls_io_info_t const *io, size_t response_limit)
+{
+    if (process == NULL || io->state != VIREO_TLS_IO_OPEN || io->read_size == 0 ||
+        io->write_size > io->options.write_capacity ||
+        io->options.write_capacity - io->write_size < response_limit) return false;
+    vireo_tcp_server_process_stop_t const stop = process->stop_reason;
+    return stop == VIREO_TCP_SERVER_PROCESS_MESSAGE_BUDGET ||
+        stop == VIREO_TCP_SERVER_PROCESS_REQUEST_BUDGET ||
+        stop == VIREO_TCP_SERVER_PROCESS_RESPONSE_BUDGET ||
+        stop == VIREO_TCP_SERVER_PROCESS_WRITE_FULL;
+}
+
+/**
+ * @brief 一次末尾观察/flow/MOD及去重入队，独立保存同步与队列次因
+ *
+ * @param[in,out] server
+ *     已持有driving_active的本轮资源根。
+ * @param[in] client
+ *     已核验当前租约。
+ * @param[in,out] connection
+ *     当前connection短借，只经公开依赖同步mask。
+ * @param[in,out] tls
+ *     同一TLS短借，状态不复制为长期字段。
+ * @param[in] allow_continuation
+ *     数据主过程成功时true，失败时只允许MOD恢复入队。
+ * @param[in] process
+ *     可空已成功处理报告，决定缓存续探。
+ * @param[in] response_limit
+ *     已验证最大响应长度，无process时不用。
+ * @param[out] needs_processing
+ *     可空独立提示，按真实最终FIFO派生。
+ * @param[out] info
+ *     必需typed零局部报告，逐提交填写实际事实。
+ * @param[in,out] detail
+ *     必需主诊断，只修改sync/queue字段，不覆盖数据首因。
+ * @param[in] gate
+ *     可空本核心短借故障门，失败不得修改server或伪造提交。
+ * @param[in,out] gate_context
+ *     可空上下文，仅借至本轮返回，不保存。
+ *
+ * @return
+ *     同步失败优先，其次队列结果；二者独立保存。
+ *
+ * @note 无native/handler/资源清理；MOD失败不假装回滚，queue_append至多一次。
+ */
+static vireo_result_t tls_application_sync(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_connection_t *connection,
+    vireo_tls_connection_t *tls, bool allow_continuation,
+    vireo_tcp_server_process_info_t const *process, size_t response_limit,
+    bool *needs_processing, vireo_tcp_server_tls_flow_info_t *info,
+    vireo_tcp_server_tls_application_error_t *detail,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    vireo_tls_io_info_t io = {0};
+    detail->sync_stage = VIREO_TCP_SERVER_TLS_APPLICATION_INSPECT;
+    vireo_result_t result = ops->io_inspect(ops->context, tls, &io, &detail->sync_tls_error);
+    if (result != VIREO_OK) goto done;
+    if ((io.state != VIREO_TLS_IO_OPEN && io.state != VIREO_TLS_IO_FAILED) ||
+        io.read_size > io.options.read_capacity || io.write_size > io.options.write_capacity) {
+        result = VIREO_RESULT_INTERNAL;
+        goto done;
+    }
+    detail->sync_stage = VIREO_TCP_SERVER_TLS_APPLICATION_FLOW;
+    result = ops->flow_refresh(ops->context, tls, &info->flow, &detail->sync_tls_error);
+    if (result != VIREO_OK) goto done;
+    info->flow_reported = true;
+    detail->sync_stage = VIREO_TCP_SERVER_TLS_APPLICATION_INSPECT;
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, connection, &current);
+    if (result != VIREO_OK) goto done;
+    info->interests = current.loop_interests;
+    uint32_t desired = 0;
+    if (io.state == VIREO_TLS_IO_OPEN) {
+        desired = VIREO_EPOLL_INTEREST_PEER_WRITE_CLOSED;
+        if (info->flow.want_read) desired |= VIREO_EPOLL_INTEREST_READ;
+        if (info->flow.want_write) desired |= VIREO_EPOLL_INTEREST_WRITE;
+    }
+    if (desired != info->interests) {
+        info->sync_called = true;
+        detail->sync_stage = VIREO_TCP_SERVER_TLS_APPLICATION_SYNC;
+        result = server->client_ops.set_interests(server->client_ops.context, connection,
+            desired, &detail->sync_loop_error);
+        if (result == VIREO_OK) info->interests = desired;
+    }
+    bool const processing = allow_continuation && tls_processing_pending(process, &io, response_limit);
+    if (needs_processing != NULL) *needs_processing = processing;
+    if ((allow_continuation && (processing || info->flow.resume_read || info->flow.resume_write)) ||
+        (info->sync_called && result != VIREO_OK)) {
+        info->queue_called = true;
+        detail->queue_result = gate != NULL ? gate(gate_context, server, client) : VIREO_OK;
+        if (detail->queue_result == VIREO_OK)
+            detail->queue_result = queue_append(server, client.slot_index);
+        info->continuation_pending = detail->queue_result == VIREO_OK;
+    }
+done:
+    detail->sync_result = result;
+    if (result == VIREO_OK) {
+        detail->sync_stage = VIREO_TCP_SERVER_TLS_APPLICATION_NONE;
+        detail->sync_tls_error = (vireo_tls_connection_error_t){0};
+        detail->sync_loop_error = (vireo_connection_loop_error_t){0};
+    }
+    return result != VIREO_OK ? result : detail->queue_result;
+}
+
+vireo_result_t vireo_tcp_server_client_tls_flow_refresh_with_gate(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_flow_info_t *out_info,
+    vireo_tcp_server_tls_application_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_application_error_t detail = {0};
+    vireo_tcp_server_tls_flow_info_t progress = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL) goto finish;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_tls_io_info_t io = {0};
+    result = tls_application_lookup(server, client, &connection, &tls, &io, &detail, false, false);
+    if (result != VIREO_OK) goto finish;
+    server->driving_active = true;
+    result = tls_application_sync(server, client, connection, tls, true, NULL, 0, NULL,
+        &progress, &detail, gate, gate_context);
+    server->driving_active = false;
+    if (result != VIREO_OK) detail.stage = detail.sync_result != VIREO_OK
+        ? detail.sync_stage : VIREO_TCP_SERVER_TLS_APPLICATION_QUEUE;
+finish:
+    if (out_info != NULL) *out_info = progress;
+    return tls_application_finish(result, &detail, error, saved);
+}
+
+/**
+ * @brief 判断原TLS是否真正发布子报告，并检查其预算与枚举不变量
+ *
+ * @param[in,out] progress
+ *     必需局部报告；入口用非法stop哨兵识别原生前保持，未发布时清typed零。
+ * @param[in] budget
+ *     必需已复制的本方向预算。
+ * @param[out] reported
+ *     必需独立bool，发布时true。
+ * @param[in] result
+ *     原调用分类，OK却未发布视为不变量失败。
+ *
+ * @return
+ *     原分类，或报告违约INTERNAL。
+ *
+ * @note 不把非法枚举传播给caller，不按报告猜测原生已经发送。
+ */
+static vireo_result_t tls_io_report(vireo_tls_io_progress_t *progress,
+    vireo_tls_io_budget_t const *budget, bool *reported, vireo_result_t result)
+{
+    if (progress->stop_reason == (vireo_tls_io_stop_t)-1) {
+        *progress = (vireo_tls_io_progress_t){0};
+        return result == VIREO_OK ? VIREO_RESULT_INTERNAL : result;
+    }
+    *reported = true;
+    if (progress->stop_reason < VIREO_TLS_IO_STOP_WOULD_BLOCK ||
+        progress->stop_reason > VIREO_TLS_IO_STOP_FLOW_PAUSED ||
+        progress->wait < VIREO_TLS_IO_WAIT_NONE || progress->wait > VIREO_TLS_IO_WAIT_WRITE ||
+        progress->bytes > budget->max_bytes || progress->native_calls > budget->max_native_calls) {
+        *progress = (vireo_tls_io_progress_t){0};
+        *reported = false;
+        return VIREO_RESULT_INTERNAL;
+    }
+    return result;
+}
+
+/** 已核容量上的稳定重试下限；原生scratch上限是公共TLS常量。 */
+static size_t tls_minimum_budget(size_t capacity)
+{ return capacity < VIREO_TLS_IO_SCRATCH_BYTES ? capacity : VIREO_TLS_IO_SCRATCH_BYTES; }
+
+/**
+ * @brief 复用原应用有界核心并保留整轮调度保护
+ * @param[in,out] server 存活TLS根，无其他不允许的在途。
+ * @param[in] client 当前完整租约。
+ * @param[in] options 原帧上限，入口复制。
+ * @param[in] budget 原三预算，入口复制且各自本轮只用一次。
+ * @param[in,out] wire_workspace caller独立响应工作区短借。
+ * @param[in] workspace_capacity 实际字节容量。
+ * @param[in] handler 原有界同步回调。
+ * @param[in,out] context 可空handler短借上下文。
+ * @param[out] out_info 必需原阶段事实报告。
+ * @param[out] error 可空原完整主/次诊断。
+ * @param[in] gate 可空原本core排队故障门。
+ * @param[in,out] gate_context gate短借上下文。
+ * @param[in] from_round 仅内部客户轮为true，公共wrapper为false。
+ * @param[in] from_serve 仅原服务core可信调用可越过自身serving，其他保护保持。
+ * @return 原应用drive分类，不重放或回滚已经提交的业务。
+ * @note 仅改变可信组合门禁，原预算/重试/flow合同保持；保持errno。
+ */
+static vireo_result_t tls_drive(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_process_options_t const *options,
+    vireo_tcp_server_tls_drive_budget_t const *budget, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_drive_info_t *out_info, vireo_tcp_server_tls_application_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context, bool from_round, bool from_serve)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_application_error_t detail = {0};
+    vireo_tcp_server_tls_drive_info_t progress = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || options == NULL || budget == NULL || wire_workspace == NULL ||
+        handler == NULL || out_info == NULL) goto finish;
+    vireo_tcp_server_process_options_t const limits = *options;
+    vireo_tcp_server_tls_drive_budget_t const allowance = *budget;
+    size_t const head = VIREO_PROTOCOL_HEADER_SIZE;
+    result = VIREO_RESULT_RANGE;
+    if (limits.max_request_frame_bytes < head || limits.max_response_frame_bytes < head ||
+        limits.max_request_frame_bytes - head > VIREO_PROTOCOL_MAX_BODY_SIZE ||
+        limits.max_response_frame_bytes - head > VIREO_PROTOCOL_MAX_BODY_SIZE ||
+        workspace_capacity < limits.max_response_frame_bytes ||
+        allowance.receive.max_bytes == 0 || allowance.receive.max_native_calls == 0 ||
+        allowance.send.max_bytes == 0 || allowance.send.max_native_calls == 0 ||
+        allowance.process.max_messages == 0 ||
+        allowance.process.max_request_bytes < limits.max_request_frame_bytes ||
+        allowance.process.max_response_bytes < limits.max_response_frame_bytes) goto finish;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_tls_io_info_t io = {0};
+    result = tls_application_lookup(server, client, &connection, &tls, &io, &detail, from_round, from_serve);
+    if (result != VIREO_OK) goto finish;
+    result = VIREO_RESULT_RANGE;
+    if (limits.max_request_frame_bytes > io.options.max_read_unit_bytes ||
+        limits.max_request_frame_bytes > io.options.read_capacity ||
+        limits.max_response_frame_bytes > io.options.write_capacity ||
+        allowance.receive.max_bytes < tls_minimum_budget(io.options.read_capacity) ||
+        allowance.send.max_bytes < tls_minimum_budget(io.options.write_capacity) ||
+        allowance.receive.max_bytes < io.read_retry_bytes ||
+        allowance.send.max_bytes < io.write_retry_bytes) goto finish;
+    server->driving_active = true;
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    vireo_tls_io_flow_t flow = {0};
+    if (io.state == VIREO_TLS_IO_FAILED) {
+        /* 公开receive重现缓存首错，FAILED保证零native，不能进入handler。 */
+        detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_RECEIVE;
+        goto receive;
+    }
+    detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_FLOW;
+    result = ops->flow_refresh(ops->context, tls, &flow, &detail.tls_error);
+    if (result != VIREO_OK) goto final_sync;
+    if (flow.priority_retry == VIREO_TLS_IO_OPERATION_WRITE) {
+        detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_SEND;
+        progress.send_called = true;
+        progress.send.stop_reason = (vireo_tls_io_stop_t)-1;
+        result = ops->send(ops->context, tls, &allowance.send, &progress.send, &detail.tls_error);
+        result = tls_io_report(&progress.send, &allowance.send, &progress.send_reported, result);
+        if (result != VIREO_OK) goto final_sync;
+        detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_FLOW;
+        result = ops->flow_refresh(ops->context, tls, &flow, &detail.tls_error);
+        if (result != VIREO_OK) goto final_sync;
+    }
+    if (flow.application_read_enabled || flow.priority_retry == VIREO_TLS_IO_OPERATION_READ) {
+receive:
+        detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_RECEIVE;
+        progress.receive_called = true;
+        progress.receive.stop_reason = (vireo_tls_io_stop_t)-1;
+        result = ops->receive(ops->context, tls, &allowance.receive, &progress.receive, &detail.tls_error);
+        result = tls_io_report(&progress.receive, &allowance.receive, &progress.receive_reported, result);
+        if (result != VIREO_OK) goto final_sync;
+    }
+    detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_PROCESS;
+    progress.process_called = true;
+    result = process_client(server, client, &limits, &allowance.process, wire_workspace,
+        workspace_capacity, handler, context, &progress.process, &detail.client_error, true);
+    if (result != VIREO_OK) goto final_sync;
+    if (!progress.send_called) {
+        detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_FLOW;
+        result = ops->flow_refresh(ops->context, tls, &flow, &detail.tls_error);
+        if (result != VIREO_OK) goto final_sync;
+        if (flow.want_write || flow.priority_retry == VIREO_TLS_IO_OPERATION_WRITE) {
+            /* READ-WANT_WRITE也需要WRITE关注，但不能趁机执行另一原操作。 */
+            if (flow.priority_retry != VIREO_TLS_IO_OPERATION_READ) {
+                detail.stage = VIREO_TCP_SERVER_TLS_APPLICATION_SEND;
+                progress.send_called = true;
+                progress.send.stop_reason = (vireo_tls_io_stop_t)-1;
+                result = ops->send(ops->context, tls, &allowance.send, &progress.send, &detail.tls_error);
+                result = tls_io_report(&progress.send, &allowance.send, &progress.send_reported, result);
+            }
+        }
+    }
+final_sync:
+    {
+        vireo_result_t const synced = tls_application_sync(server, client, connection, tls,
+            result == VIREO_OK, result == VIREO_OK && progress.process_called ? &progress.process : NULL,
+            limits.max_response_frame_bytes, &progress.needs_processing, &progress.sync, &detail,
+            gate, gate_context);
+        if (result == VIREO_OK) {
+            result = synced;
+            detail.stage = detail.sync_result != VIREO_OK ? detail.sync_stage :
+                (detail.queue_result != VIREO_OK ? VIREO_TCP_SERVER_TLS_APPLICATION_QUEUE :
+                    VIREO_TCP_SERVER_TLS_APPLICATION_NONE);
+        }
+    }
+    server->driving_active = false;
+finish:
+    if (result == VIREO_OK) detail = (vireo_tcp_server_tls_application_error_t){0};
+    if (out_info != NULL) *out_info = progress;
+    return tls_application_finish(result, &detail, error, saved);
+}
+
+/* 公共入口不开放故障门；本core测试的短借hook不改变生产依赖表。 */
+vireo_result_t vireo_tcp_server_client_tls_drive_with_gate(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_process_options_t const *options,
+    vireo_tcp_server_tls_drive_budget_t const *budget, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_drive_info_t *out_info, vireo_tcp_server_tls_application_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{ return tls_drive(server, client, options, budget, wire_workspace, workspace_capacity,
+    handler, context, out_info, error, gate, gate_context, false, false); }
+
+vireo_result_t vireo_tcp_server_client_tls_flow_refresh(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_flow_info_t *out_info,
+    vireo_tcp_server_tls_application_error_t *error)
+{
+    return vireo_tcp_server_client_tls_flow_refresh_with_gate(server, client, out_info, error, NULL, NULL);
+}
+
+vireo_result_t vireo_tcp_server_client_tls_drive(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_process_options_t const *options,
+    vireo_tcp_server_tls_drive_budget_t const *budget, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_drive_info_t *out_info, vireo_tcp_server_tls_application_error_t *error)
+{
+    return vireo_tcp_server_client_tls_drive_with_gate(server, client, options, budget,
+        wire_workspace, workspace_capacity, handler, context, out_info, error, NULL, NULL);
+}
+
+/**
+ * @brief 发布完整诊断并恢复入口errno。
+ * @param[in] result 已决定的主分类。
+ * @param[in] detail 必需独立typed诊断短借。
+ * @param[out] error 可空独立可写诊断。
+ * @param[in] saved 入口errno。
+ * @return 原result，无资源交接或其他副作用。
+ */
+static vireo_result_t tls_close_finish(vireo_result_t result,
+    vireo_tcp_server_tls_close_error_t const *detail,
+    vireo_tcp_server_tls_close_error_t *error, int saved)
+{
+    if (error != NULL) *error = *detail;
+    errno = saved;
+    return result;
+}
+
+/**
+ * @brief 在入口持有driving_active后取得短借并核三阶段及真实绑定。
+ * @param[in,out] server 本轮TLS资源根，调用者已禁止重入。
+ * @param[in] client 当前完整租约。
+ * @param[out] connection 必需独立短借，不跨release。
+ * @param[out] tls 必需独立TLS短借，不跨release。
+ * @param[out] io 必需独立应用容量/阶段快照。
+ * @param[out] close 必需独立关闭快照。
+ * @param[in,out] detail 必需本轮主诊断，仅记录前置失败。
+ * @return 原观察/租约分类；阶段不满足BUSY，矛盾状态INTERNAL。
+ * @note 不采时/native/MOD/移交owner，外层恢复errno。
+ */
+static vireo_result_t tls_close_lookup(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_connection_t **connection,
+    vireo_tls_connection_t **tls, vireo_tls_io_info_t *io, vireo_tls_close_info_t *close,
+    vireo_tcp_server_tls_close_error_t *detail)
+{
+    detail->stage = VIREO_TCP_SERVER_TLS_CLOSE_LOOKUP;
+    detail->client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_LOOKUP;
+    vireo_result_t result = find_client(server, client, connection);
+    if (result != VIREO_OK) return result;
+    if (!server->clients[client.slot_index].bound) return VIREO_RESULT_NOT_FOUND;
+    result = vireo_connection_tls_borrow(*connection, tls);
+    if (result != VIREO_OK) return result;
+    detail->client_error = (vireo_tcp_server_client_error_t){0};
+    detail->stage = VIREO_TCP_SERVER_TLS_CLOSE_INSPECT;
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    vireo_tls_connection_info_t handshake = {0};
+    result = ops->inspect(ops->context, *tls, &handshake, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (handshake.handshake_state < VIREO_TLS_HANDSHAKE_INITIAL ||
+        handshake.handshake_state > VIREO_TLS_HANDSHAKE_FAILED) return VIREO_RESULT_INTERNAL;
+    if (handshake.handshake_state != VIREO_TLS_HANDSHAKE_ESTABLISHED) return VIREO_RESULT_BUSY;
+    result = ops->close_inspect(ops->context, *tls, close, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (close->state < VIREO_TLS_CLOSE_NONE || close->state > VIREO_TLS_CLOSE_FAILED)
+        return VIREO_RESULT_INTERNAL;
+    result = ops->io_inspect(ops->context, *tls, io, &detail->tls_error);
+    if (result != VIREO_OK) return result;
+    if (io->state == VIREO_TLS_IO_DISABLED || io->state == VIREO_TLS_IO_PREPARED)
+        return VIREO_RESULT_BUSY;
+    if ((io->state != VIREO_TLS_IO_OPEN && io->state != VIREO_TLS_IO_FAILED) ||
+        io->read_size > io->options.read_capacity || io->write_size > io->options.write_capacity)
+        return VIREO_RESULT_INTERNAL;
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, *connection, &current);
+    if (result != VIREO_OK) return result;
+    if (!current.loop_attached) return VIREO_RESULT_NOT_FOUND;
+    detail->stage = VIREO_TCP_SERVER_TLS_CLOSE_NONE;
+    return VIREO_OK;
+}
+
+/**
+ * @brief 一次最终关闭观察、实际MOD及去重入队，保留全部次因。
+ * @param[in,out] server 本轮已持driving_active资源根。
+ * @param[in] client 已核有效租约。
+ * @param[in,out] connection 同一存活短借，只经公开依赖修改mask。
+ * @param[in] tls 同一存活TLS短借，只观察。
+ * @param[in] allow_continuation 主过程成功才正常续排；MOD失败仍可恢复入队。
+ * @param[out] info 必需typed零报告，逐阶段填写真实事实。
+ * @param[in,out] detail 必需诊断，只改sync/queue，不覆盖主因。
+ * @param[in] gate 可空本server单次只读故障门。
+ * @param[in,out] context 可空gate上下文，仅借至返回，不保存。
+ * @return 同步错误优先于队列错误，无回滚/native/handler/owner移交。
+ */
+static vireo_result_t tls_close_sync(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_connection_t *connection,
+    vireo_tls_connection_t const *tls, bool allow_continuation,
+    vireo_tcp_server_tls_close_flow_info_t *info, vireo_tcp_server_tls_close_error_t *detail,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *context)
+{
+    detail->sync_stage = VIREO_TCP_SERVER_TLS_CLOSE_INSPECT;
+    vireo_result_t result = server->tls_ops.close_inspect(server->tls_ops.context, tls,
+        &info->close, &detail->sync_tls_error);
+    if (result != VIREO_OK) goto done;
+    info->close_reported = true;
+    if (info->close.state < VIREO_TLS_CLOSE_DRAINING || info->close.state > VIREO_TLS_CLOSE_FAILED ||
+        info->close.wait < VIREO_TLS_IO_WAIT_NONE || info->close.wait > VIREO_TLS_IO_WAIT_WRITE) {
+        result = VIREO_RESULT_INTERNAL; goto done;
+    }
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, connection, &current);
+    if (result != VIREO_OK) goto done;
+    info->interests = current.loop_interests;
+    if (!current.loop_attached) { result = VIREO_RESULT_NOT_FOUND; goto done; }
+    bool const active = info->close.state <= VIREO_TLS_CLOSE_WAIT_PEER;
+    bool const runnable = active && !info->close.needs_consume;
+    uint32_t desired = 0;
+    if (runnable) {
+        desired = VIREO_EPOLL_INTEREST_PEER_WRITE_CLOSED;
+        if (info->close.wait == VIREO_TLS_IO_WAIT_READ) desired |= VIREO_EPOLL_INTEREST_READ;
+        if (info->close.wait == VIREO_TLS_IO_WAIT_WRITE) desired |= VIREO_EPOLL_INTEREST_WRITE;
+    }
+    if (desired != info->interests) {
+        info->sync_called = true;
+        detail->sync_stage = VIREO_TCP_SERVER_TLS_CLOSE_SYNC;
+        result = server->client_ops.set_interests(server->client_ops.context, connection,
+            desired, &detail->sync_loop_error);
+        if (result == VIREO_OK) info->interests = desired;
+    }
+    if ((allow_continuation && runnable && info->close.resume) ||
+        (info->sync_called && result != VIREO_OK)) {
+        info->queue_called = true;
+        detail->queue_result = gate != NULL ? gate(context, server, client) : VIREO_OK;
+        if (detail->queue_result == VIREO_OK)
+            detail->queue_result = queue_append(server, client.slot_index);
+        info->continuation_pending = detail->queue_result == VIREO_OK;
+    }
+done:
+    detail->sync_result = result;
+    if (result == VIREO_OK) {
+        detail->sync_stage = VIREO_TCP_SERVER_TLS_CLOSE_NONE;
+        detail->sync_tls_error = (vireo_tls_connection_error_t){0};
+        detail->sync_loop_error = (vireo_connection_loop_error_t){0};
+    }
+    return result != VIREO_OK ? result : detail->queue_result;
+}
+
+/**
+ * @brief 最终同步次因提升阶段；已有request/step首因时不使用。
+ * @param[in] detail 必需独立局部诊断，只读短借。
+ * @return 同步失败阶段，否则QUEUE；无状态修改/资源交接。
+ */
+static vireo_tcp_server_tls_close_stage_t tls_close_sync_stage(
+    vireo_tcp_server_tls_close_error_t const *detail)
+{ return detail->sync_result != VIREO_OK ? detail->sync_stage : VIREO_TCP_SERVER_TLS_CLOSE_QUEUE; }
+
+vireo_result_t vireo_tcp_server_client_tls_close_request_with_gate(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, uint64_t timeout_ns,
+    vireo_tcp_server_tls_close_request_info_t *out_info, vireo_tcp_server_tls_close_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *context)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_close_request_info_t info = {0};
+    vireo_tcp_server_tls_close_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL || timeout_ns == 0) goto finish;
+    if (server->owned_tls_context == NULL || auxiliary_active(server) || server->running_active) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    server->driving_active = true;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_tls_io_info_t io = {0};
+    vireo_tls_close_info_t close = {0};
+    result = tls_close_lookup(server, client, &connection, &tls, &io, &close, &detail);
+    if (result != VIREO_OK) goto driven;
+    if (close.state != VIREO_TLS_CLOSE_NONE) { result = VIREO_RESULT_BUSY; goto driven; }
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    if (io.state != VIREO_TLS_IO_FAILED) {
+        detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_CLOCK;
+        result = ops->now(ops->context, &info.now_ns, &detail.clock_error);
+        if (result != VIREO_OK) goto driven;
+        info.sampled = true;
+        detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_DEADLINE;
+        result = vireo_clock_deadline_after(info.now_ns, timeout_ns, &info.deadline_ns);
+        if (result != VIREO_OK) goto driven;
+        info.deadline_computed = true;
+    }
+    detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_REQUEST;
+    info.request_called = true;
+    result = ops->close_request(ops->context, tls, info.now_ns, info.deadline_ns, &detail.tls_error);
+    if (result != VIREO_OK) goto driven;
+    /* FAILED应用必须拒绝，不接受违约依赖假装成功封口。 */
+    if (io.state == VIREO_TLS_IO_FAILED) { result = VIREO_RESULT_INTERNAL; goto driven; }
+    info.requested = true;
+    detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_NONE;
+    result = tls_close_sync(server, client, connection, tls, true, &info.sync, &detail, gate, context);
+    if (result != VIREO_OK) detail.stage = tls_close_sync_stage(&detail);
+driven:
+    server->driving_active = false;
+finish:
+    if (out_info != NULL) *out_info = info;
+    return tls_close_finish(result, &detail, error, saved);
+}
+
+/**
+ * @brief 复用原关闭单步并保持客户轮外层保护
+ * @param[in,out] server 同Reactor存活TLS根。
+ * @param[in] client 当前已绑定且已请求关闭的完整租约。
+ * @param[in] max_bytes 原正关闭单步字节预算。
+ * @param[out] out_info 必需原关闭/同步事实。
+ * @param[out] error 可空原完整主/次原因。
+ * @param[in] gate 可空本core排队故障门。
+ * @param[in,out] context gate短借上下文。
+ * @param[in] from_round 仅可信内部客户轮true，其他在途仍拒绝。
+ * @param[in] from_serve 仅原服务core可信调用可越过自身serving，其他保护保持。
+ * @return 原关闭/采时/MOD分类，终态不执行native。
+ * @note 不消费尾部、不调用handler/归还；保持原固定due及入口errno。
+ */
+static vireo_result_t tls_close_step(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, size_t max_bytes,
+    vireo_tcp_server_tls_close_step_info_t *out_info, vireo_tcp_server_tls_close_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *context, bool from_round, bool from_serve)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_close_step_info_t info = {0};
+    vireo_tcp_server_tls_close_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL) goto finish;
+    if (server->owned_tls_context == NULL || tls_stage_active(server, from_round, from_serve)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    server->driving_active = true;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_tls_io_info_t io = {0};
+    vireo_tls_close_info_t close = {0};
+    result = tls_close_lookup(server, client, &connection, &tls, &io, &close, &detail);
+    if (result != VIREO_OK) goto driven;
+    if (close.state == VIREO_TLS_CLOSE_NONE) { result = VIREO_RESULT_BUSY; goto driven; }
+    if (max_bytes == 0 || max_bytes < tls_minimum_budget(io.options.read_capacity) ||
+        max_bytes < tls_minimum_budget(io.options.write_capacity)) {
+        result = VIREO_RESULT_RANGE; goto driven;
+    }
+    vireo_tcp_server_tls_ops_t const *ops = &server->tls_ops;
+    if (close.state <= VIREO_TLS_CLOSE_WAIT_PEER) {
+        detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_CLOCK;
+        result = ops->now(ops->context, &info.now_ns, &detail.clock_error);
+        if (result != VIREO_OK) goto driven;
+        info.sampled = true;
+    }
+    detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_STEP;
+    info.step_called = true;
+    info.progress.stop_reason = (vireo_tls_close_stop_t)-1;
+    result = ops->close_step_at(ops->context, tls, info.now_ns, max_bytes,
+        &info.progress, &detail.tls_error);
+    if (info.progress.stop_reason == (vireo_tls_close_stop_t)-1) {
+        info.progress = (vireo_tls_close_progress_t){0};
+        if (result == VIREO_OK) result = VIREO_RESULT_INTERNAL;
+    } else if (info.progress.stop_reason < VIREO_TLS_CLOSE_STOP_PROGRESS ||
+        info.progress.stop_reason > VIREO_TLS_CLOSE_STOP_ERROR ||
+        info.progress.read_bytes > max_bytes || info.progress.write_bytes > max_bytes ||
+        info.progress.info.state < VIREO_TLS_CLOSE_DRAINING ||
+        info.progress.info.state > VIREO_TLS_CLOSE_FAILED) {
+        info.progress = (vireo_tls_close_progress_t){0};
+        result = VIREO_RESULT_INTERNAL;
+    } else info.progress_reported = true;
+    if (result == VIREO_OK) detail.stage = VIREO_TCP_SERVER_TLS_CLOSE_NONE;
+    vireo_result_t const sync = tls_close_sync(server, client, connection, tls, result == VIREO_OK,
+        &info.sync, &detail, gate, context);
+    if (result == VIREO_OK && sync != VIREO_OK) { result = sync; detail.stage = tls_close_sync_stage(&detail); }
+driven:
+    server->driving_active = false;
+finish:
+    if (out_info != NULL) *out_info = info;
+    return tls_close_finish(result, &detail, error, saved);
+}
+
+vireo_result_t vireo_tcp_server_client_tls_close_step_with_gate(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, size_t max_bytes,
+    vireo_tcp_server_tls_close_step_info_t *out_info, vireo_tcp_server_tls_close_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *context)
+{ return tls_close_step(server, client, max_bytes, out_info, error, gate, context, false, false); }
+
+vireo_result_t vireo_tcp_server_client_tls_close_flow_refresh_with_gate(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_close_flow_info_t *out_info,
+    vireo_tcp_server_tls_close_error_t *error, vireo_tcp_server_tls_application_queue_gate_t gate,
+    void *context)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_close_flow_info_t info = {0};
+    vireo_tcp_server_tls_close_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL) goto finish;
+    if (server->owned_tls_context == NULL || auxiliary_active(server) || server->running_active) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    server->driving_active = true;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    vireo_tls_io_info_t io = {0};
+    vireo_tls_close_info_t close = {0};
+    result = tls_close_lookup(server, client, &connection, &tls, &io, &close, &detail);
+    if (result == VIREO_OK && close.state == VIREO_TLS_CLOSE_NONE) result = VIREO_RESULT_BUSY;
+    if (result == VIREO_OK) {
+        result = tls_close_sync(server, client, connection, tls, true, &info, &detail, gate, context);
+        if (result != VIREO_OK) detail.stage = tls_close_sync_stage(&detail);
+    }
+    server->driving_active = false;
+finish:
+    if (out_info != NULL) *out_info = info;
+    return tls_close_finish(result, &detail, error, saved);
+}
+
+vireo_result_t vireo_tcp_server_client_tls_close_request(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, uint64_t timeout_ns,
+    vireo_tcp_server_tls_close_request_info_t *out_info, vireo_tcp_server_tls_close_error_t *error)
+{ return vireo_tcp_server_client_tls_close_request_with_gate(server, client, timeout_ns, out_info,
+    error, NULL, NULL); }
+
+vireo_result_t vireo_tcp_server_client_tls_close_step(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, size_t max_bytes,
+    vireo_tcp_server_tls_close_step_info_t *out_info, vireo_tcp_server_tls_close_error_t *error)
+{ return vireo_tcp_server_client_tls_close_step_with_gate(server, client, max_bytes, out_info,
+    error, NULL, NULL); }
+
+vireo_result_t vireo_tcp_server_client_tls_close_flow_refresh(vireo_tcp_server_t *server,
+    vireo_connection_pool_lease_t client, vireo_tcp_server_tls_close_flow_info_t *out_info,
+    vireo_tcp_server_tls_close_error_t *error)
+{ return vireo_tcp_server_client_tls_close_flow_refresh_with_gate(server, client, out_info, error,
+    NULL, NULL); }
+
+/**
+ * @brief 在等待前按固定TLS容量核共同预算，不根据当前阶段放宽参数
+ * @param[in] server 非空TLS根短借，只读固定配置。
+ * @param[in] o 非空入口复制的选项。
+ * @param[in] workspace 字节容量，须容纳最大响应整帧。
+ * @return 预算和帧兼容时true，无观察/native/分配。
+ * @note 差值只在验证帧不小于头后计算；locked请求仍由原客户核心核验。
+ */
+static bool tls_round_values(vireo_tcp_server_t const *server,
+    vireo_tcp_server_tls_round_options_t const *o, size_t workspace)
+{
+    size_t const head = VIREO_PROTOCOL_HEADER_SIZE;
+    vireo_tls_io_options_t const *io = &server->tls_options.io;
+    return o->process.max_request_frame_bytes >= head && o->process.max_response_frame_bytes >= head &&
+        o->process.max_request_frame_bytes - head <= VIREO_PROTOCOL_MAX_BODY_SIZE &&
+        o->process.max_response_frame_bytes - head <= VIREO_PROTOCOL_MAX_BODY_SIZE &&
+        o->process.max_request_frame_bytes <= io->read_capacity &&
+        o->process.max_request_frame_bytes <= io->max_read_unit_bytes &&
+        o->process.max_response_frame_bytes <= io->write_capacity &&
+        workspace >= o->process.max_response_frame_bytes &&
+        o->drive.receive.max_native_calls > 0 && o->drive.send.max_native_calls > 0 &&
+        o->drive.receive.max_bytes >= tls_minimum_budget(io->read_capacity) &&
+        o->drive.send.max_bytes >= tls_minimum_budget(io->write_capacity) &&
+        o->drive.process.max_messages > 0 &&
+        o->drive.process.max_request_bytes >= o->process.max_request_frame_bytes &&
+        o->drive.process.max_response_bytes >= o->process.max_response_frame_bytes &&
+        o->close_max_bytes >= tls_minimum_budget(io->read_capacity) &&
+        o->close_max_bytes >= tls_minimum_budget(io->write_capacity);
+}
+
+/**
+ * @brief 按当前完整身份和真实公开TLS状态分派唯一阶段
+ * @param[in,out] server 非空TLS根，整轮scheduling_active保持。
+ * @param[in] o 已验证局部配置，短借至返回。
+ * @param[in,out] workspace caller独立响应工作区短借。
+ * @param[in] capacity 工作区实际容量。
+ * @param[in] handler 原有界同步回调，不修改同根。
+ * @param[in,out] context 可空handler短借上下文。
+ * @param[in,out] turn 已撤取客户的局部typed报告，尚无阶段进度。
+ * @param[in] gate 可空本core交接排队测试门，只观察、不改变资源。
+ * @param[in,out] gate_context gate短借上下文。
+ * @param[in] from_serve 仅可信服务轮传递的外层保护来源，不放宽其他在途。
+ * @return 原阶段或交接分类；成功typed清诊断，失败保留已提交事实。
+ * @note 无第二owner/状态缓存；关闭不自动消费/handler/归还，原恢复次因保持。
+ */
+static vireo_result_t tls_round_dispatch(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_round_options_t const *o, uint8_t *workspace, size_t capacity,
+    vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *turn,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context, bool from_serve)
+{
+    vireo_tcp_server_tls_round_error_t *e = &turn->error;
+    vireo_connection_t *connection = NULL;
+    vireo_tls_connection_t *tls = NULL;
+    e->stage = VIREO_TCP_SERVER_TLS_ROUND_LOOKUP;
+    e->client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_LOOKUP;
+    vireo_result_t result = find_client(server, turn->client, &connection);
+    if (result != VIREO_OK) return result;
+    if (!server->clients[turn->client.slot_index].bound) return VIREO_RESULT_NOT_FOUND;
+    result = vireo_connection_tls_borrow(connection, &tls);
+    if (result != VIREO_OK) return result;
+    e->client_error = (vireo_tcp_server_client_error_t){0};
+    e->stage = VIREO_TCP_SERVER_TLS_ROUND_INSPECT;
+    e->client_error.primary.stage = VIREO_TCP_SERVER_CLIENT_INSPECT;
+    vireo_connection_info_t current = {0};
+    result = server->client_ops.inspect(server->client_ops.context, connection, &current);
+    if (result != VIREO_OK) return result;
+    if (!current.loop_attached) return VIREO_RESULT_NOT_FOUND;
+    e->client_error = (vireo_tcp_server_client_error_t){0};
+    vireo_tls_connection_info_t state = {0};
+    result = server->tls_ops.inspect(server->tls_ops.context, tls, &state, &e->tls_error);
+    if (result != VIREO_OK) return result;
+    if (state.handshake_state < VIREO_TLS_HANDSHAKE_INITIAL ||
+        state.handshake_state > VIREO_TLS_HANDSHAKE_FAILED) return VIREO_RESULT_INTERNAL;
+    if (state.handshake_state != VIREO_TLS_HANDSHAKE_ESTABLISHED) {
+        turn->path = VIREO_TCP_SERVER_TLS_TURN_HANDSHAKE;
+        e->stage = VIREO_TCP_SERVER_TLS_ROUND_HANDSHAKE;
+        result = tls_handshake_step(server, turn->client, &turn->handshake, &e->handshake_error, true, from_serve);
+        if (result == VIREO_OK && turn->handshake.application_ready) {
+            e->stage = VIREO_TCP_SERVER_TLS_ROUND_HANDOFF_QUEUE;
+            result = gate != NULL ? gate(gate_context, server, turn->client) : VIREO_OK;
+            if (result == VIREO_OK) result = queue_append(server, turn->client.slot_index);
+        }
+    } else {
+        vireo_tls_close_info_t close = {0};
+        result = server->tls_ops.close_inspect(server->tls_ops.context, tls, &close, &e->tls_error);
+        if (result != VIREO_OK) return result;
+        if (close.state < VIREO_TLS_CLOSE_NONE || close.state > VIREO_TLS_CLOSE_FAILED)
+            return VIREO_RESULT_INTERNAL;
+        if (close.state == VIREO_TLS_CLOSE_NONE) {
+            turn->path = VIREO_TCP_SERVER_TLS_TURN_APPLICATION;
+            e->stage = VIREO_TCP_SERVER_TLS_ROUND_APPLICATION;
+            result = tls_drive(server, turn->client, &o->process, &o->drive, workspace,
+                capacity, handler, context, &turn->application, &e->application_error, NULL, NULL, true, from_serve);
+        } else {
+            turn->path = VIREO_TCP_SERVER_TLS_TURN_CLOSE;
+            e->stage = VIREO_TCP_SERVER_TLS_ROUND_CLOSE;
+            result = tls_close_step(server, turn->client, o->close_max_bytes,
+                &turn->close, &e->close_error, NULL, NULL, true, from_serve);
+        }
+    }
+    if (result == VIREO_OK) *e = (vireo_tcp_server_tls_round_error_t){0};
+    return result;
+}
+
+/**
+ * @brief 原客户轮与服务轮共用的有限TLS调度core
+ * @param[in,out] server 原TLS根，可信serve可已持serving，不撤标记。
+ * @param[in] options 原完整数值选项，入口复制。
+ * @param[in,out] wire_workspace 原独立响应工作区短借。
+ * @param[in] workspace_capacity 原实际字节数。
+ * @param[in] handler 原有界非阻塞回调，禁止同根可变重入。
+ * @param[in,out] context 原可空短借上下文。
+ * @param[out] out_turns 原真实撤取前缀，含首失败客户。
+ * @param[in] turn_capacity 原正数组容量。
+ * @param[out] out_info 原每可写路径事实。
+ * @param[out] error 原可空完整typed错误。
+ * @param[in] gate 可空握手交接只读排队故障门。
+ * @param[in,out] gate_context gate调用期短借。
+ * @param[in] from_serve 仅可信serve为true，公共wrapper恒false。
+ * @return 原客户轮分类，首错suffix/两扫描/停止语义保持。
+ * @note 只取得自身scheduling保护并原样解除；外层serving保持，恢复errno。
+ */
+static vireo_result_t tls_run_once(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_round_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_tcp_server_tls_round_info_t *out_info, vireo_tcp_server_tls_round_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context, bool from_serve)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_round_info_t progress = {0};
+    vireo_tcp_server_tls_round_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || options == NULL || wire_workspace == NULL || handler == NULL ||
+        out_turns == NULL || out_info == NULL) goto finish;
+    vireo_tcp_server_tls_round_options_t const o = *options;
+    if (o.timeout_ms < 0) goto finish;
+    if (server->owned_tls_context == NULL || tls_stage_active(server, false, from_serve)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    if (turn_capacity == 0 || turn_capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        o.round.max_clients == 0 || o.round.max_clients > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        !tls_round_values(server, &o, workspace_capacity)) {
+        result = VIREO_RESULT_RANGE; goto finish;
+    }
+    if (server->listener == NULL || !server->listener_bound) {
+        result = VIREO_RESULT_NOT_FOUND; goto finish;
+    }
+    if (!queue_valid(server)) {
+        result = VIREO_RESULT_INTERNAL; detail.stage = VIREO_TCP_SERVER_TLS_ROUND_QUEUE; goto finish;
+    }
+    progress.queued_before_wait = server->queue_count;
+    progress.remaining_count = server->queue_count;
+    result = stop_snapshot(server, &progress.stopped);
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_ROUND_WAIT; goto finish; }
+    if (progress.stopped) goto finish;
+    server->scheduling_active = true;
+    vireo_tcp_server_tls_poll_report_t waited = {0};
+    waited.poll.queued_before_wait = server->queue_count;
+    waited.poll.effective_timeout_ms = server->queue_count != 0 ? 0 : o.timeout_ms;
+    result = ready_wait(server, &waited.poll, &waited.listener_events, &waited, &detail.wait_error);
+    progress.wait = waited.poll.wait;
+    progress.wait_called = waited.poll.wait_called;
+    progress.stopped = waited.poll.stopped;
+    progress.effective_timeout_ms = waited.poll.effective_timeout_ms;
+    progress.listener_events = waited.listener_events;
+    progress.scanned_slots = waited.scanned_slots;
+    progress.expired_clients = waited.expired_clients;
+    progress.has_deadline = waited.has_deadline;
+    progress.nearest_deadline_ns = waited.nearest_deadline_ns;
+    progress.before_wait_ns = waited.before_wait_ns;
+    progress.after_wait_ns = waited.after_wait_ns;
+    progress.queued_after_wait = waited.poll.queued_after_wait;
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_ROUND_WAIT; goto done; }
+    detail.wait_error = (vireo_tcp_server_tls_error_t){0};
+    if (progress.stopped) goto done;
+    size_t count = progress.queued_after_wait;
+    if (count > o.round.max_clients) count = o.round.max_clients;
+    if (count > turn_capacity) count = turn_capacity;
+    for (size_t k = 0; k < count; ++k) {
+        size_t const index = server->queue_head;
+        if (index >= server->options.connection_capacity) {
+            result = VIREO_RESULT_INTERNAL; detail.stage = VIREO_TCP_SERVER_TLS_ROUND_QUEUE; break;
+        }
+        client_slot_t const *slot = &server->clients[index];
+        vireo_tcp_server_tls_turn_result_t turn = {.client = slot->lease, .events = slot->pending_events};
+        result = queue_remove(server, index);
+        if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_ROUND_QUEUE; break; }
+        turn.result = tls_round_dispatch(server, &o, wire_workspace, workspace_capacity,
+            handler, context, &turn, gate, gate_context, from_serve);
+        result = turn.result;
+        if (result != VIREO_OK) {
+            turn.error.client = turn.client;
+            detail = turn.error;
+            ++progress.failed_count;
+        } else ++progress.succeeded_count;
+        out_turns[progress.turn_count++] = turn;
+        if (result != VIREO_OK) break;
+    }
+done:
+    progress.remaining_count = server->queue_count;
+    server->scheduling_active = false;
+finish:
+    if (out_info != NULL) *out_info = progress;
+    if (error != NULL) *error = detail;
+    errno = saved;
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_tls_run_once_with_gate(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_round_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_tcp_server_tls_round_info_t *out_info, vireo_tcp_server_tls_round_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{ return tls_run_once(server, options, wire_workspace, workspace_capacity, handler, context,
+    out_turns, turn_capacity, out_info, error, gate, gate_context, false); }
+
+vireo_result_t vireo_tcp_server_tls_run_once(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_round_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_tcp_server_tls_round_info_t *out_info, vireo_tcp_server_tls_round_error_t *error)
+{ return vireo_tcp_server_tls_run_once_with_gate(server, options, wire_workspace, workspace_capacity,
+    handler, context, out_turns, turn_capacity, out_info, error, NULL, NULL); }
+
+/**
+ * @brief 在外层整段保护内按固定真账同步监听，省略同值MOD
+ * @param[in,out] server 非空TLS根，已owned/bound监听且持serving_active。
+ * @param[out] info 非空局部五事实，先typed零，数值拒绝不发布假actual。
+ * @param[out] error 非空局部监听原因，只有真实MOD失败标UPDATE。
+ * @return OK目标已成立，INTERNAL坏账，其他为原set_read分类。
+ * @note 不计算count*per或未验证减法；无申请/采时/owner，外层恢复errno。
+ */
+static vireo_result_t tls_admission_sync(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_admission_info_t *info, vireo_tcp_server_listener_error_t *error)
+{
+    *info = (vireo_tcp_server_tls_admission_info_t){0};
+    *error = (vireo_tcp_server_listener_error_t){0};
+    size_t const per = server->tls_per_connection_bytes;
+    size_t const maximum = server->tls_options.max_tls_resource_bytes;
+    if (server->client_count > server->options.connection_capacity ||
+        server->buffer_bytes > server->options.max_buffer_bytes ||
+        server->tls_pair_bytes == 0 || server->tls_pair_bytes > server->options.max_buffer_bytes ||
+        per == 0 || per > maximum || server->client_count > maximum / per)
+        return VIREO_RESULT_INTERNAL;
+    *info = (vireo_tcp_server_tls_admission_info_t){
+        .connection_limited = server->client_count == server->options.connection_capacity,
+        .buffer_limited = server->tls_pair_bytes > server->options.max_buffer_bytes - server->buffer_bytes,
+        .tls_resource_limited = server->client_count == maximum / per,
+        .listener_read_enabled = server->listener_read_enabled};
+    bool const desired = !info->connection_limited && !info->buffer_limited && !info->tls_resource_limited;
+    if (desired == server->listener_read_enabled) return VIREO_OK;
+    info->sync_called = true;
+    vireo_result_t const result = server->listener_ops.set_read(server->listener_ops.context,
+        server->listener, desired, &error->acceptor_error);
+    if (result == VIREO_OK) server->listener_read_enabled = desired;
+    else error->stage = VIREO_TCP_SERVER_LISTENER_UPDATE;
+    info->listener_read_enabled = server->listener_read_enabled;
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_tls_admission_refresh(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_admission_info_t *out_info, vireo_tcp_server_listener_error_t *error)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_admission_info_t info = {0};
+    vireo_tcp_server_listener_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || out_info == NULL) goto finish;
+    if (server->owned_tls_context == NULL || tls_stage_active(server, false, false)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    if (server->listener == NULL || !server->listener_bound) {
+        result = VIREO_RESULT_NOT_FOUND; goto finish;
+    }
+    server->serving_active = true;
+    result = tls_admission_sync(server, &info, &detail);
+    server->serving_active = false;
+finish:
+    if (out_info != NULL) *out_info = info;
+    return listener_finish(result, &detail, error, saved);
+}
+
+vireo_result_t vireo_tcp_server_tls_serve_once_with_gate(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_serve_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_connection_pool_lease_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_tls_serve_info_t *out_info, vireo_tcp_server_tls_serve_error_t *error,
+    vireo_tcp_server_tls_application_queue_gate_t gate, void *gate_context)
+{
+    int const saved = errno;
+    vireo_tcp_server_tls_serve_info_t progress = {0};
+    vireo_tcp_server_tls_serve_error_t detail = {0};
+    vireo_result_t result = VIREO_RESULT_INVALID_ARGUMENT;
+    if (server == NULL || options == NULL || wire_workspace == NULL || handler == NULL ||
+        out_turns == NULL || out_clients == NULL || out_info == NULL) goto finish;
+    vireo_tcp_server_tls_serve_options_t const o = *options;
+    if (o.round.timeout_ms < 0 || o.admit.max_accepts == 0 || o.admit.max_accept_syscalls == 0)
+        goto finish;
+    if (server->owned_tls_context == NULL || tls_stage_active(server, false, false)) {
+        result = VIREO_RESULT_BUSY; goto finish;
+    }
+    if (turn_capacity == 0 || turn_capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        client_capacity == 0 || client_capacity > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        o.round.round.max_clients == 0 || o.round.round.max_clients > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        o.admit.max_accepts > VIREO_TCP_SERVER_MAX_CONNECTIONS ||
+        !tls_round_values(server, &o.round, workspace_capacity)) {
+        result = VIREO_RESULT_RANGE; goto finish;
+    }
+    size_t const limit = o.admit.max_accepts < client_capacity ? o.admit.max_accepts : client_capacity;
+    for (size_t k = 0; k < limit; ++k) {
+        if (!lease_empty(out_clients[k])) {
+            result = VIREO_RESULT_INVALID_ARGUMENT; goto finish;
+        }
+    }
+    if (server->listener == NULL || !server->listener_bound) {
+        result = VIREO_RESULT_NOT_FOUND; goto finish;
+    }
+    if (!queue_valid(server)) {
+        result = VIREO_RESULT_INTERNAL;
+        detail.stage = VIREO_TCP_SERVER_TLS_SERVE_ROUND;
+        detail.round_error.stage = VIREO_TCP_SERVER_TLS_ROUND_QUEUE;
+        goto finish;
+    }
+    server->serving_active = true;
+    result = stop_snapshot(server, &progress.stopped);
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_SERVE_STOP; goto done; }
+    if (progress.stopped) goto done;
+    progress.pre_sync_called = true;
+    result = tls_admission_sync(server, &progress.pre_sync, &detail.listener_error);
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_SERVE_PRE_SYNC; goto done; }
+    result = tls_run_once(server, &o.round, wire_workspace, workspace_capacity, handler, context,
+        out_turns, turn_capacity, &progress.round, &detail.round_error, NULL, NULL, true);
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_SERVE_ROUND; goto sync; }
+    progress.stopped = progress.round.stopped;
+    if (progress.stopped) goto sync;
+    result = stop_snapshot(server, &progress.stopped);
+    if (result != VIREO_OK) { detail.stage = VIREO_TCP_SERVER_TLS_SERVE_STOP; goto sync; }
+    if (progress.stopped) goto sync;
+    if ((progress.round.listener_events & (VIREO_EPOLL_EVENT_ERROR | VIREO_EPOLL_EVENT_HANGUP)) != 0) {
+        result = VIREO_RESULT_IO;
+        detail.stage = VIREO_TCP_SERVER_TLS_SERVE_LISTENER_EVENT;
+        goto sync;
+    }
+    if ((progress.round.listener_events & VIREO_EPOLL_EVENT_READ) != 0) {
+        progress.admission_called = true;
+        result = tls_admit_batch(server, &o.admit, out_clients, client_capacity,
+            &progress.admission, &detail.admission_error, true, gate, gate_context);
+        if (result != VIREO_OK) detail.stage = VIREO_TCP_SERVER_TLS_SERVE_ADMIT;
+    }
+sync:
+    /* 已经进入的服务进度不能回滚；末尾失败保留最先的业务/接入原因。 */
+    progress.post_sync_called = true;
+    vireo_tcp_server_listener_error_t sync_error = {0};
+    vireo_result_t const synced = tls_admission_sync(server, &progress.post_sync, &sync_error);
+    if (synced != VIREO_OK) {
+        if (result == VIREO_OK) {
+            result = synced;
+            detail.stage = VIREO_TCP_SERVER_TLS_SERVE_POST_SYNC;
+            detail.listener_error = sync_error;
+        } else {
+            detail.sync_result = synced;
+            detail.sync_error = sync_error;
+        }
+    }
+done:
+    server->serving_active = false;
+finish:
+    if (out_info != NULL) *out_info = progress;
+    if (error != NULL) *error = detail;
+    errno = saved;
+    return result;
+}
+
+vireo_result_t vireo_tcp_server_tls_serve_once(vireo_tcp_server_t *server,
+    vireo_tcp_server_tls_serve_options_t const *options, uint8_t *wire_workspace,
+    size_t workspace_capacity, vireo_tcp_server_sync_handler_t handler, void *context,
+    vireo_tcp_server_tls_turn_result_t *out_turns, size_t turn_capacity,
+    vireo_connection_pool_lease_t *out_clients, size_t client_capacity,
+    vireo_tcp_server_tls_serve_info_t *out_info, vireo_tcp_server_tls_serve_error_t *error)
+{ return vireo_tcp_server_tls_serve_once_with_gate(server, options, wire_workspace, workspace_capacity,
+    handler, context, out_turns, turn_capacity, out_clients, client_capacity, out_info, error, NULL, NULL); }

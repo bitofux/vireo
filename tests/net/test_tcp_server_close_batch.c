@@ -126,7 +126,7 @@ static vireo_result_t create_client(void *ctx, vireo_connection_options_t const 
     fixture_t *f = ctx;
     ++f->create_calls;
     if (f->fail_create_on == f->create_calls) {
-        *error = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_ALLOCATE_CONTROL, 0};
+        *error = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_ALLOCATE_CONTROL, .system_errno = 0};
         return VIREO_RESULT_NO_MEMORY;
     }
     int const raw = *fd;
@@ -189,7 +189,7 @@ static vireo_result_t release_client(void *ctx, vireo_connection_pool_t *pool,
     if (r == VIREO_OK && f->release_io) { /* 真实消费后注入 IO，不能再次 close。 */
         error->stage = VIREO_CONNECTION_POOL_OPERATION_DESTROY_CONNECTION;
         error->connection_error =
-            (vireo_connection_error_t){VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EINTR};
+            (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EINTR};
         return VIREO_RESULT_IO;
     }
     return r;
@@ -274,7 +274,7 @@ static vireo_result_t receive_bytes(void *ctx, vireo_connection_t *c,
         }
         ++i->recv_calls; /* 窄seam模拟下一次失败，保留之前真实接收。 */
         i->stop_reason = VIREO_CONNECTION_RECEIVE_STOP_ERROR;
-        *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_RECEIVE, f->receive_errno};
+        *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_RECEIVE, .system_errno = f->receive_errno};
         errno = ERANGE;
         return VIREO_RESULT_IO;
     }
@@ -310,7 +310,7 @@ static vireo_result_t send_bytes(void *ctx, vireo_connection_t *c,
         }
         ++i->send_calls;
         i->stop_reason = VIREO_CONNECTION_SEND_STOP_ERROR;
-        *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_SEND, f->send_errno};
+        *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_SEND, .system_errno = f->send_errno};
         errno = ERANGE;
         return VIREO_RESULT_IO;
     }

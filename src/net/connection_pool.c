@@ -530,13 +530,66 @@ static vireo_result_t find_entry(vireo_connection_pool_t const *pool,
     return VIREO_OK;
 }
 
+/**
+ * @brief 仅通过公开TLS快照验证可收纳阶段，不把RAW关闭初值当TLS许可
+ *
+ * @param[in,out] connection caller仍拥有的存活连接，仅短借TLS，不修改连接。
+ * @param[in] transport 本次connection inspect得到的固定模式。
+ * @param[out] error 独立局部诊断；仅公共TLS观察失败时保存完整原因。
+ *
+ * @return RAW或合法PREPARED/OPEN为OK；未准备/失败/关闭BUSY；矛盾状态INTERNAL。
+ * @note 无网络/资源交接；TLS观察清线程库队列，最外层恢复errno，RAW不触TLS。
+ */
+static vireo_result_t inspect_transport(vireo_connection_t *connection,
+    vireo_connection_transport_t transport, vireo_connection_error_t *error)
+{
+    if (transport == VIREO_CONNECTION_TRANSPORT_RAW) { return VIREO_OK; }
+    if (transport != VIREO_CONNECTION_TRANSPORT_TLS) { return VIREO_RESULT_INTERNAL; }
+    vireo_tls_connection_t *tls = NULL;
+    vireo_result_t result = vireo_connection_tls_borrow(connection, &tls);
+    if (result != VIREO_OK) { return VIREO_RESULT_INTERNAL; }
+    vireo_tls_connection_error_t detail = {0};
+    vireo_tls_connection_info_t handshake;
+    vireo_tls_io_info_t io;
+    vireo_tls_close_info_t close;
+    result = vireo_tls_connection_inspect(tls, &handshake, &detail);
+    if (result == VIREO_OK) { result = vireo_tls_connection_io_inspect(tls, &io, &detail); }
+    if (result == VIREO_OK) { result = vireo_tls_connection_close_inspect(tls, &close, &detail); }
+    if (result != VIREO_OK) {
+        *error = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_TLS,
+            .system_errno = detail.system_errno, .tls_error = detail};
+        return result;
+    }
+    switch (close.state) {
+    case VIREO_TLS_CLOSE_NONE:
+    case VIREO_TLS_CLOSE_DRAINING:
+    case VIREO_TLS_CLOSE_NOTIFYING:
+    case VIREO_TLS_CLOSE_WAIT_PEER:
+    case VIREO_TLS_CLOSE_COMPLETE:
+    case VIREO_TLS_CLOSE_FAILED:
+        break;
+    default:
+        return VIREO_RESULT_INTERNAL;
+    }
+    if (io.state == VIREO_TLS_IO_DISABLED || io.state == VIREO_TLS_IO_FAILED ||
+        handshake.handshake_state == VIREO_TLS_HANDSHAKE_FAILED || close.state != VIREO_TLS_CLOSE_NONE) {
+        return VIREO_RESULT_BUSY;
+    }
+    bool prepared = io.state == VIREO_TLS_IO_PREPARED &&
+        (handshake.handshake_state == VIREO_TLS_HANDSHAKE_INITIAL ||
+         handshake.handshake_state == VIREO_TLS_HANDSHAKE_HANDSHAKING);
+    bool open = io.state == VIREO_TLS_IO_OPEN &&
+        handshake.handshake_state == VIREO_TLS_HANDSHAKE_ESTABLISHED;
+    return prepared || open ? VIREO_OK : VIREO_RESULT_INTERNAL;
+}
+
 vireo_result_t vireo_connection_pool_adopt(vireo_connection_pool_t *pool,
                                           vireo_connection_t **connection_owner,
                                           vireo_connection_pool_lease_t *out_lease,
                                           vireo_connection_pool_operation_error_t *error)
 {
     int const saved_errno = errno;
-    vireo_connection_error_t const no_connection_error = {VIREO_CONNECTION_STAGE_NONE, 0};
+    vireo_connection_error_t const no_connection_error = {.stage = VIREO_CONNECTION_STAGE_NONE, .system_errno = 0};
     vireo_connection_pool_operation_stage_t stage = VIREO_CONNECTION_POOL_OPERATION_NONE;
     vireo_result_t result;
     vireo_connection_info_t info;
@@ -553,6 +606,11 @@ vireo_result_t vireo_connection_pool_adopt(vireo_connection_pool_t *pool,
     result = pool->connection_ops.inspect(pool->connection_ops.context, *connection_owner, &info);
     if (result != VIREO_OK) {
         return operation_finish(result, stage, no_connection_error, error, saved_errno);
+    }
+    vireo_connection_error_t transport_error = {.stage = VIREO_CONNECTION_STAGE_NONE};
+    result = inspect_transport(*connection_owner, info.transport, &transport_error);
+    if (result != VIREO_OK) {
+        return operation_finish(result, stage, transport_error, error, saved_errno);
     }
     result = vireo_checked_size_add(info.read_buffer.capacity, info.write_buffer.capacity,
                                     &buffer_bytes);
@@ -636,7 +694,7 @@ vireo_result_t vireo_connection_pool_release(vireo_connection_pool_t *pool,
                                             vireo_connection_pool_operation_error_t *error)
 {
     int const saved_errno = errno;
-    vireo_connection_error_t connection_error = {VIREO_CONNECTION_STAGE_NONE, 0};
+    vireo_connection_error_t connection_error = {.stage = VIREO_CONNECTION_STAGE_NONE, .system_errno = 0};
     vireo_connection_pool_operation_stage_t stage = VIREO_CONNECTION_POOL_OPERATION_NONE;
     connection_index_entry_t *entry;
     vireo_result_t result;

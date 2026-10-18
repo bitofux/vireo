@@ -22,12 +22,19 @@
 #include <vireo/base/result.h>
 #include <vireo/protocol/codec.h>
 #include <vireo/net/event_loop.h>
+#include <vireo/net/tls_connection.h>
 
 /** 两字节区合计硬限；不含控制块、allocator/RSS、内核或多连接全局开销。 */
 #define VIREO_CONNECTION_MAX_BUFFER_BYTES ((size_t)67108864)
 
 /** 唯一拥有型对象；不公开布局或 sizeof，不可复制；所有入口仅 Reactor 线程使用。 */
 typedef struct vireo_connection vireo_connection_t;
+
+/** 创建后固定的资源模式；不支持热切换或STARTTLS。 */
+typedef enum vireo_connection_transport {
+    VIREO_CONNECTION_TRANSPORT_RAW = 0,
+    VIREO_CONNECTION_TRANSPORT_TLS = 1
+} vireo_connection_transport_t;
 
 /** 三项均显式提供；成功创建后固定，不提供增长或 buffer 句柄。 */
 typedef struct vireo_connection_options {
@@ -87,6 +94,7 @@ typedef struct vireo_connection_info {
     vireo_connection_close_state_t close_state;   /**< 永久逻辑阶段，非内核状态。 */
     vireo_connection_close_mode_t close_mode;     /**< 当前模式；只可 DRAIN 升立即。 */
     vireo_connection_close_reason_t close_reason; /**< 首次原因，未请求为 NONE。 */
+    vireo_connection_transport_t transport; /**< TLS模式必须读取TLS的flow/close状态，见下方合同。 */
 } vireo_connection_info_t;
 
 /** 诊断阶段；NONE 表示成功或参数/容量拒绝，系统原因只在 IO 时有效。 */
@@ -99,13 +107,72 @@ typedef enum vireo_connection_stage {
     VIREO_CONNECTION_STAGE_CLOSE_SOCKET = 5,        /**< 销毁时单次 close 失败。 */
     VIREO_CONNECTION_STAGE_RECEIVE = 6,             /**< 接收系统失败或内部不变量异常。 */
     VIREO_CONNECTION_STAGE_ENQUEUE = 7,             /**< 排队内部不变量异常。 */
-    VIREO_CONNECTION_STAGE_SEND = 8                 /**< 发送系统失败或内部不变量异常。 */
+    VIREO_CONNECTION_STAGE_SEND = 8,                /**< 发送系统失败或内部不变量异常。 */
+    VIREO_CONNECTION_STAGE_TLS = 9                  /**< TLS委托结果，完整原因见tls_error。 */
 } vireo_connection_stage_t;
 
 typedef struct vireo_connection_error {
     vireo_connection_stage_t stage; /**< 此次结果对应阶段。 */
     int system_errno;              /**< IO 原 errno；其他分类为 0。 */
+    vireo_tls_connection_error_t tls_error; /**< TLS委托失败完整诊断；其他结果全零。 */
 } vireo_connection_error_t;
+
+/**
+ * TLS模式合同（以下旧入口的扩展，RAW模式行为保持）：
+ * - create_tls_server只建立资源；借TLS后可INITIAL时io_prepare，再arm/step成功启用；
+ *   或沿原路径先arm/step握手，再io_configure。两种配置路径互斥且容量固定。
+ * - inspect的两buffer来自TLS真实FIFO；未配置两buffer/容量/预算/EOF全零。
+ *   buffer_capacity_bytes为两FIFO之和，max_buffer_bytes为TLS总预算扣除两暂存。
+ *   PREPARED时两buffer/容量/预算已真实存在，size为0/EOF为false，不表示握手完成。
+ * - read_eof表示已处理真实close_notify；read_peek/consume/frames/enqueue共用TLS队列。
+ *   DISABLED/PREPARED时上述业务入口BUSY（含零消费/入队），主要输出保持；
+ *   frames的max_frame_bytes还须<=max_read_unit_bytes。
+ * - 业务委托沿TLS原合同清理OpenSSL错误队列并保持errno；RAW的无库操作合同不变。
+ * - receive/send、三flow入口、request_close/close_refresh在TLS模式BUSY，零网络/MOD。
+ *   原max_syscalls仍只计raw系统调用；TLS通过借用对象及max_native_calls显式驱动。
+ * - 本层flow/pressure/options与close三字段仅描述RAW策略，TLS模式保持初始值；
+ *   TLS实际压力、EOF、首错、期限和关闭状态以原TLS接口为准，不复制第二套状态。
+ * - attach/set_interests/detach/forget保持显式绑定；caller按TLS真实WANT方向更新关注，
+ *   安排库内明文/预算续调度及无fd事件的到期唤醒。本层不自动安排。
+ * - 任何经借用TLS的receive/consume/合法close_step同样按TLS合同结束旧read/frame view。
+ * - destroy须先结束全部借用/view；仍受loop/callback在途保护，先TLS无网络销毁再close fd。
+ */
+
+/**
+ * @brief 建立拥有fd与TLS的服务器连接，不创建raw双buffer
+ * @param[in] context 非空服务器context，短借到返回；成功SSL持内部引用，包装可随后销毁。
+ * @param[in] tls_options 非空稳定wrapper预算，仅短借；沿TLS创建的正数/硬限合同。
+ * @param[in,out] fd_owner 独立唯一owner，入口>=0（含0），已连接NONBLOCK/CLOEXEC stream；
+ *     不得已注册loop或通过其他别名并发操作。成功清为-1，失败保持且不close。
+ * @param[in,out] out_connection 独立NULL owner，成功接管组合；失败保持。
+ * @param[out] error 可空独立诊断；TLS失败为TLS阶段并保留完整tls_error，其他结果清零它。
+ * @retval VIREO_OK 完整资源发布；未握手/未配置应用FIFO/未注册loop。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT 必需指针/owner/资源形态不符合合同。
+ * @retval VIREO_RESULT_RANGE TLS预算不合法。
+ * @retval VIREO_RESULT_NO_MEMORY 本层控制块或TLS资源分配失败。
+ * @retval VIREO_RESULT_IO 只读socket资格查询失败。
+ * @retval VIREO_RESULT_INTERNAL TLS配置或native不变量异常。
+ * @note 不网络/dup/改fd属性。失败逆序回滚；成功后connection唯一拥有fd与TLS。
+ *     输入/输出/诊断互不重叠且不位于自有资源；Reactor-only，保持errno。
+ *     实际TLS原生操作仍要求应用稳定SIG_IGN，创建/销毁不代替该策略。
+ */
+vireo_result_t vireo_connection_create_tls_server(vireo_tls_context_t const *context,
+    vireo_tls_connection_options_t const *tls_options, int *fd_owner,
+    vireo_connection_t **out_connection, vireo_connection_error_t *error);
+
+/**
+ * @brief 借用组合内同一Vireo TLS对象，不转移owner
+ * @param[in,out] connection 非空存活对象，所有操作与销毁由同Reactor串行。
+ * @param[out] out_borrowed_tls 非空独立输出，成功得到借用指针，失败保持。
+ * @retval VIREO_OK 取得借用；不证明握手/I/O/关闭已就绪。
+ * @retval VIREO_RESULT_NOT_FOUND RAW模式没有TLS。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT 必需地址为空。
+ * @note 可调用原TLS公开握手/配置/收发/flow/关闭/观测；禁止destroy、move到owner容器、
+ *     跨线程或超出connection寿命使用。借用必须先于connection destroy结束。
+ *     不分配/网络/库队列操作，不读写errno，不授予native/fd/buffer句柄。
+ */
+vireo_result_t vireo_connection_tls_borrow(vireo_connection_t *connection,
+    vireo_tls_connection_t **out_borrowed_tls);
 
 /** 本轮 recv 的独立双上限；各为任意正 size_t，无默认值或额外硬限。 */
 typedef struct vireo_connection_receive_budget {

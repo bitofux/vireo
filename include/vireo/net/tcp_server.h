@@ -17,6 +17,9 @@
 #ifndef VIREO_NET_TCP_SERVER_H
 #define VIREO_NET_TCP_SERVER_H
 
+/** TLS扩展见tcp_server_tls.h：旧RAW准入/自动服务/run/poll/关闭策略在TLS根BUSY；
+ * 通用inspect/release/stop/shutdown/监听控制及显式schedule可复用。 */
+
 #include <vireo/net/acceptor.h>
 #include <vireo/net/connection_pool.h>
 #include <vireo/net/event_loop.h>
@@ -36,7 +39,7 @@ typedef struct vireo_tcp_server vireo_tcp_server_t;
 typedef struct vireo_tcp_server_options {
     size_t connection_capacity; /**< 1..MAX_CONNECTIONS，loop 注册容量派生为此值加一。 */
     size_t event_capacity;      /**< 1..EVENT_LOOP_MAX_EVENTS，独立于连接数量。 */
-    size_t max_memory_bytes;    /**< 1..MAX_MEMORY，计 control/客户元数据、完整 loop、pool 和可选 listener。 */
+    size_t max_memory_bytes;    /**< 1..MAX_MEMORY，计control/客户元数据、完整loop/pool/可选listener，TLS扩展另含context包装。 */
     size_t max_buffer_bytes;    /**< 1..CONNECTION_POOL_MAX_BUFFER_MEMORY，不预申请客户区。 */
 } vireo_tcp_server_options_t;
 
@@ -57,7 +60,7 @@ typedef struct vireo_tcp_server_info {
     size_t loop_allocation_bytes;   /**< 公开 loop 的完整申请，已包含 epoll。 */
     size_t pool_allocation_bytes;   /**< 公开 connection_pool 的完整申请，已包含基础 pool。 */
     size_t listener_allocation_bytes; /**< 已收纳 acceptor 的实际申请，未收纳为零。 */
-    size_t allocation_bytes;       /**< server+loop+pool+listener 受检合计，不另加 slots。 */
+    size_t allocation_bytes;       /**< server+loop+pool+listener；TLS扩展另含context包装，不另加slots。 */
     bool listener_owned;
     bool listener_bound;
     bool listener_read_enabled;

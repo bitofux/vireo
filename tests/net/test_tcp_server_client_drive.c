@@ -158,7 +158,7 @@ static vireo_result_t receive_bytes(void *ctx, vireo_connection_t *c,
     /* 真实前缀/实际 calls 保留，仅在 wrapper 返回边界注入 IO，不冒称 kernel EIO。 */
     if (result == VIREO_OK && f->receive_io) {
         i->stop_reason = VIREO_CONNECTION_RECEIVE_STOP_ERROR;
-        *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_RECEIVE, EIO};
+        *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_RECEIVE, .system_errno = EIO};
         return VIREO_RESULT_IO;
     }
     return result;
@@ -189,7 +189,7 @@ static vireo_result_t send_bytes(void *ctx, vireo_connection_t *c,
     /* 同上：实际发送进度先发生，IO 是返回边界注入，不虚构额外 send_calls。 */
     if (result == VIREO_OK && f->send_io) {
         i->stop_reason = VIREO_CONNECTION_SEND_STOP_ERROR;
-        *e = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_SEND, EINTR};
+        *e = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_SEND, .system_errno = EINTR};
         return VIREO_RESULT_IO;
     }
     return result;

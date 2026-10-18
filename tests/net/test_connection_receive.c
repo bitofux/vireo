@@ -411,7 +411,7 @@ static void test_empty_and_would_block(void)
     check_bytes(connection, NULL, 0);
     vireo_connection_receive_budget_t budget = {8, 2};
     vireo_connection_receive_info_t info;
-    vireo_connection_error_t error = {VIREO_CONNECTION_STAGE_CLOSE_SOCKET, EIO};
+    vireo_connection_error_t error = {.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = EIO};
     errno = 0;
     CHECK(vireo_connection_receive(connection, &budget, &info, &error) == VIREO_OK);
     CHECK(errno == 0);
@@ -796,7 +796,7 @@ static void test_would_block_after_progress(void)
     f.fail_errno = EAGAIN;
     vireo_connection_receive_budget_t budget = {16, 2};
     vireo_connection_receive_info_t info;
-    vireo_connection_error_t error = {VIREO_CONNECTION_STAGE_RECEIVE, EIO};
+    vireo_connection_error_t error = {.stage = VIREO_CONNECTION_STAGE_RECEIVE, .system_errno = EIO};
     errno = E2BIG;
     CHECK(vireo_connection_receive(connection, &budget, &info, &error) == VIREO_OK);
     check_info(&info, 2, 2, VIREO_CONNECTION_RECEIVE_STOP_WOULD_BLOCK);

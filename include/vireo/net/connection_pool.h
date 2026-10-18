@@ -81,10 +81,10 @@ typedef enum vireo_connection_pool_operation_stage {
     VIREO_CONNECTION_POOL_OPERATION_RELEASE_SLOT = 4        /**< 合法基础租约归还不变量异常。 */
 } vireo_connection_pool_operation_stage_t;
 
-/** 按值操作诊断；只有连接销毁失败时保留原 connection 诊断。 */
+/** 按值操作诊断；连接销毁或TLS准入观察失败时保留完整 connection 诊断。 */
 typedef struct vireo_connection_pool_operation_error {
     vireo_connection_pool_operation_stage_t stage; /**< 此次本层操作阶段。 */
-    vireo_connection_error_t connection_error;     /**< 原连接错误，其他阶段为 NONE/0。 */
+    vireo_connection_error_t connection_error;     /**< 原连接销毁/TLS观察错误，其余为 NONE/0。 */
 } vireo_connection_pool_operation_error_t;
 
 /**
@@ -184,7 +184,8 @@ vireo_result_t vireo_connection_pool_destroy(vireo_connection_pool_t **pool,
  * @retval VIREO_RESULT_RANGE
  *     单连接双 buffer 容量超过全池额度。
  * @retval VIREO_RESULT_BUSY
- *     连接已绑定、回调在途、正在关闭，或槽位/累计 buffer 额度暂不足。
+ *     连接已绑定、回调在途、正在关闭，或槽位/累计 buffer 额度暂不足；
+ *     TLS未准备FIFO、握手/应用已失败或已经请求TLS关闭。
  * @retval VIREO_RESULT_OVERFLOW
  *     受检容量合计不可表示，或基础存储发放序号耗尽。
  * @retval VIREO_RESULT_INTERNAL
@@ -193,6 +194,12 @@ vireo_result_t vireo_connection_pool_destroy(vireo_connection_pool_t **pool,
  * @note 失败保持输入 owner、全部租约输出及连接字节；无运行期分配，不直接接管 fd，
  *     不改变 EOF/排队数据、fd 属性或 loop 登记。只验证公开容量，不猜测 connection 布局。
  * @note 先验连接/预算检查后才领取基础槽，不承诺跨层拒绝优先级。池外临时对象不计此额度。
+ * @note TLS须有固定实际双FIFO，PREPARED仅配INITIAL/HANDSHAKING，OPEN仅配ESTABLISHED；
+ *     通过connection/TLS公开借用与快照验证，矛盾模式/容量/阶段为INTERNAL。
+ *     握手成功不重发租约或补账；入池后不得重配容量，后来握手失败不阻断lookup/release。
+ *     额度仍只计两FIFO，排除每TLS的32768暂存、控制块/OpenSSL/内核/RSS及池外候选。
+ * @note TLS分支公开观察会清线程OpenSSL错误队列，观察失败保留完整嵌套TLS诊断，
+ *     operation阶段为INSPECT_CONNECTION；RAW不新增TLS库操作。所有路径保持errno。
  * @note owner/租约/诊断为存活、正确对齐、互不重叠的独立存储，不在池或连接自有资源内。
  *     旧 owner 别名不得再当 owner 使用；字节 view 仍服从 connection 原期限。
  * @note Reactor-only，所有路径保持入口 errno；无异步身份、自动收发或损坏对象修复保证。

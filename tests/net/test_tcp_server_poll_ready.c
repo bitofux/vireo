@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -346,7 +347,16 @@ static void safe_async_submit(void) {
     CHECK(hr.submit_report.task_transferred && hr.consume_called && !hr.pending_retained && remaining == NULL);
     n = pthread_barrier_wait(&execution.release); CHECK(n == 0 || n == PTHREAD_BARRIER_SERIAL_THREAD);
     vireo_thread_pool_shutdown_report_t shutdown;
-    EXPECT(vireo_thread_pool_shutdown_and_join(pool, VIREO_TASK_QUEUE_DRAIN, &shutdown), VIREO_OK);
+    /* 放行预热worker后，公开close/回收观察允许trylock竞争BUSY；有界重试同DRAIN意图。
+     * 不放松任务恰一次/结果/owner/fd断言，也不把BUSY当作已join。 */
+    vireo_result_t retired = VIREO_RESULT_BUSY;
+    for (unsigned attempt = 0; attempt < 10000 && retired == VIREO_RESULT_BUSY; ++attempt) {
+        errno = EDOM;
+        retired = vireo_thread_pool_shutdown_and_join(pool, VIREO_TASK_QUEUE_DRAIN, &shutdown);
+        CHECK(errno == EDOM);
+        if (retired == VIREO_RESULT_BUSY) CHECK(sched_yield() == 0);
+    }
+    CHECK(retired == VIREO_OK);
     CHECK(execution.count == 1);
     vireo_thread_pool_worker_result_t result; EXPECT(vireo_thread_pool_inspect_worker_result(pool, 0, &result), VIREO_OK); CHECK(result.result == VIREO_OK);
     vireo_task_metadata_t taken;

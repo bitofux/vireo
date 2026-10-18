@@ -344,13 +344,13 @@ static vireo_result_t injected_destroy(void *context, vireo_connection_t **owner
     ++f->destroys;
     errno = ENOTTY;
     if (f->busy != 0) {
-        *error = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_NONE, 0};
+        *error = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_NONE, .system_errno = 0};
         return VIREO_RESULT_BUSY;
     }
     vireo_result_t result = vireo_connection_destroy(owner, error);
     REQUIRE(result == VIREO_OK);
     if (f->close_errno != 0) {
-        *error = (vireo_connection_error_t){VIREO_CONNECTION_STAGE_CLOSE_SOCKET, f->close_errno};
+        *error = (vireo_connection_error_t){.stage = VIREO_CONNECTION_STAGE_CLOSE_SOCKET, .system_errno = f->close_errno};
         return VIREO_RESULT_IO;
     }
     return result;
