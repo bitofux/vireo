@@ -396,7 +396,7 @@ static void explicit_worker_chain(void) {
     EXPECT(vireo_task_queue_create(&tq,&tasks),VIREO_OK); EXPECT(vireo_task_queue_prepare_wait(tasks),VIREO_OK);
     EXPECT(vireo_completion_queue_create(&cq,&w.queue),VIREO_OK); EXPECT(vireo_completion_queue_prepare_wait(w.queue),VIREO_OK);
     EXPECT(vireo_notifier_create(&no,&w.notifier,NULL),VIREO_OK);
-    vireo_event_loop_handle_t handle;
+    vireo_event_loop_handle_t handle={0};
     EXPECT(vireo_notifier_server_register(f.server,w.notifier,&handle,NULL),VIREO_OK);
     EXPECT(vireo_thread_pool_create(&po,&pool),VIREO_OK);
     vireo_thread_pool_configuration_t const config={tasks,execute,&w};
