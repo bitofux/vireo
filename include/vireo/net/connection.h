@@ -108,7 +108,8 @@ typedef enum vireo_connection_stage {
     VIREO_CONNECTION_STAGE_RECEIVE = 6,             /**< 接收系统失败或内部不变量异常。 */
     VIREO_CONNECTION_STAGE_ENQUEUE = 7,             /**< 排队内部不变量异常。 */
     VIREO_CONNECTION_STAGE_SEND = 8,                /**< 发送系统失败或内部不变量异常。 */
-    VIREO_CONNECTION_STAGE_TLS = 9                  /**< TLS委托结果，完整原因见tls_error。 */
+    VIREO_CONNECTION_STAGE_TLS = 9,                 /**< TLS委托结果，完整原因见tls_error。 */
+    VIREO_CONNECTION_STAGE_QUERY_PEER = 10          /**< 真实socket对端查询/地址形态失败。 */
 } vireo_connection_stage_t;
 
 typedef struct vireo_connection_error {
@@ -116,6 +117,44 @@ typedef struct vireo_connection_error {
     int system_errno;              /**< IO 原 errno；其他分类为 0。 */
     vireo_tls_connection_error_t tls_error; /**< TLS委托失败完整诊断；其他结果全零。 */
 } vireo_connection_error_t;
+
+/** 对端IP的独立数值快照；不是wire布局、账号身份或TLS认证结果。 */
+typedef struct vireo_connection_peer {
+    uint8_t family; /**< 仅4或6，与平台AF_*常量无数值关联。 */
+    unsigned char address[16]; /**< 网络序；IPv4前4字节有效，尾12字节为0。 */
+} vireo_connection_peer_t;
+
+/**
+ * @brief 从连接唯一拥有的真实socket查询IP，不暴露fd或可变借用。
+ *
+ * @param[in] connection
+ *     必需存活RAW/TLS连接，仅Reactor短借至返回。
+ * @param[out] peer
+ *     必需独立可写快照，仅成功整体提交，失败全部字节保持。
+ * @param[out] error
+ *     可空独立诊断，每条可写路径覆盖；成功/参数拒绝为全零。
+ *
+ * @retval VIREO_OK
+ *     已取得IPv4/IPv6地址；不证明TLS已建立、账号已认证或客户端未使用代理。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需指针NULL，未调用系统查询。
+ * @retval VIREO_RESULT_NOT_FOUND
+ *     socket地址族没有IP（如AF_UNIX），不得回退客户端自报IP。
+ * @retval VIREO_RESULT_IO
+ *     单次getpeername失败，QUERY_PEER及system_errno保存原因，包括EINTR。
+ * @retval VIREO_RESULT_INTERNAL
+ *     系统成功但地址长度异常，或内部查询返回异常正数。
+ *
+ * @note 无分配/收发/DNS/隐藏重试/状态修改；单次只读内核查询，不等待网络数据。
+ *       所有路径保持入口errno；无close/dup/fd属性变更，不结束已有读区view。
+ *       不带端口、IPv6 scope id或客户端声明字段；IPv4-mapped IPv6保留6及原16字节，
+ *       登录准入沿既有041-03合同统一归并，不能据此区分代理/NAT后的个人或设备。
+ * @note Reactor-only；同connection的销毁/收发/管理不得并发，caller禁POSIX取消。
+ *       输入、输出、诊断及errno有效对齐且互不重叠。快照不保活connection；
+ *       只在原连接身份仍有效时使用，连接池槽复用后不得沿用旧快照绑定新请求。
+ */
+vireo_result_t vireo_connection_peer_query(vireo_connection_t const *connection,
+    vireo_connection_peer_t *peer, vireo_connection_error_t *error);
 
 /**
  * TLS模式合同（以下旧入口的扩展，RAW模式行为保持）：

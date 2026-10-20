@@ -463,8 +463,11 @@ vireo_result_t vireo_task_move(vireo_task_t **source, vireo_task_t **destination
  *
  * @note
  *     所有旧裸指针别名失效，不会自动清除调用者保留的副本。
+ *     成功释放前擦除整块自有申请（控制块及 payload），原输入和其他副本仍由 caller 清理。
+ *     先成功释放取消引用，再擦除；依赖失败时保留 owner 和正文，不提前清理。
  * @note
  *     无内部同步、不自动执行或取消任务；所有路径保持 errno。
+ *     擦除成本 O(allocated_bytes)，不承诺硬实时，不保证第三方或系统副本清除。
  */
 vireo_result_t vireo_task_destroy(vireo_task_t **owner);
 

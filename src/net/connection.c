@@ -17,10 +17,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vireo/base/checked.h>
+#include <vireo/base/secure_clear.h>
 
 struct vireo_connection {
     int owned_fd;
@@ -278,6 +281,57 @@ static vireo_result_t finish(vireo_connection_error_t *error, vireo_result_t res
     }
     errno = saved_errno;
     return result;
+}
+
+/** 固定生产依赖：只查询调用期借用fd，不保存地址或改socket状态。 */
+static int query_peer_native(void *context, int fd, struct sockaddr *address, socklen_t *size)
+{
+    (void)context;
+    return getpeername(fd, address, size);
+}
+
+vireo_result_t vireo_connection_peer_query_with(vireo_connection_t const *connection,
+    vireo_connection_peer_t *peer, vireo_connection_error_t *error,
+    vireo_connection_peer_query_fn get_peer, void *context)
+{
+    int const saved_errno = errno;
+    if (connection == NULL || peer == NULL || get_peer == NULL)
+        return finish(error, VIREO_RESULT_INVALID_ARGUMENT, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+    struct sockaddr_storage address = {0};
+    socklen_t size = (socklen_t)sizeof(address);
+    int const queried = get_peer(context, connection->owned_fd, (struct sockaddr *)&address, &size);
+    int const cause = errno;
+    if (queried != 0)
+        return finish(error, queried == -1 ? VIREO_RESULT_IO : VIREO_RESULT_INTERNAL,
+            VIREO_CONNECTION_STAGE_QUERY_PEER, queried == -1 ? cause : 0, saved_errno);
+    if (size < (socklen_t)sizeof(address.ss_family) || size > (socklen_t)sizeof(address))
+        return finish(error, VIREO_RESULT_INTERNAL, VIREO_CONNECTION_STAGE_QUERY_PEER, 0, saved_errno);
+    vireo_connection_peer_t value = {0};
+    if (address.ss_family == AF_INET) {
+        if (size != (socklen_t)sizeof(struct sockaddr_in))
+            return finish(error, VIREO_RESULT_INTERNAL, VIREO_CONNECTION_STAGE_QUERY_PEER, 0, saved_errno);
+        struct sockaddr_in ipv4;
+        memcpy(&ipv4, &address, sizeof(ipv4));
+        value.family = UINT8_C(4);
+        memcpy(value.address, &ipv4.sin_addr, sizeof(ipv4.sin_addr));
+    } else if (address.ss_family == AF_INET6) {
+        if (size != (socklen_t)sizeof(struct sockaddr_in6))
+            return finish(error, VIREO_RESULT_INTERNAL, VIREO_CONNECTION_STAGE_QUERY_PEER, 0, saved_errno);
+        struct sockaddr_in6 ipv6;
+        memcpy(&ipv6, &address, sizeof(ipv6));
+        value.family = UINT8_C(6);
+        memcpy(value.address, &ipv6.sin6_addr, sizeof(ipv6.sin6_addr));
+    } else {
+        return finish(error, VIREO_RESULT_NOT_FOUND, VIREO_CONNECTION_STAGE_QUERY_PEER, 0, saved_errno);
+    }
+    *peer = value;
+    return finish(error, VIREO_OK, VIREO_CONNECTION_STAGE_NONE, 0, saved_errno);
+}
+
+vireo_result_t vireo_connection_peer_query(vireo_connection_t const *connection,
+    vireo_connection_peer_t *peer, vireo_connection_error_t *error)
+{
+    return vireo_connection_peer_query_with(connection, peer, error, query_peer_native, NULL);
 }
 
 /**
@@ -709,11 +763,14 @@ vireo_result_t vireo_connection_receive(vireo_connection_t *connection,
         ++info.recv_calls;
         ssize_t n = connection->ops.receive(connection->ops.context, connection->owned_fd,
                                              scratch, request, MSG_DONTWAIT);
+        int receive_errno = errno;
         if (n < -1 || n > (ssize_t)request) {
+            (void)vireo_secure_clear(scratch, sizeof(scratch));
             return receive_finish(out_info, info, error, VIREO_RESULT_INTERNAL, 0, saved_errno);
         }
         if (n == -1) {
-            int cause = errno;
+            (void)vireo_secure_clear(scratch, sizeof(scratch));
+            int cause = receive_errno;
             if (cause == EAGAIN || cause == EWOULDBLOCK) {
                 info.stop_reason = VIREO_CONNECTION_RECEIVE_STOP_WOULD_BLOCK;
                 break;
@@ -721,6 +778,7 @@ vireo_result_t vireo_connection_receive(vireo_connection_t *connection,
             return receive_finish(out_info, info, error, VIREO_RESULT_IO, cause, saved_errno);
         }
         if (n == 0) {
+            (void)vireo_secure_clear(scratch, sizeof(scratch));
             connection->read_eof = true;
             info.stop_reason = VIREO_CONNECTION_RECEIVE_STOP_EOF;
             break;
@@ -729,8 +787,10 @@ vireo_result_t vireo_connection_receive(vireo_connection_t *connection,
         if (vireo_checked_size_add(info.received_bytes, received,
                                    &info.received_bytes) != VIREO_OK ||
             vireo_buffer_append(connection->read_buffer, scratch, received) != VIREO_OK) {
+            (void)vireo_secure_clear(scratch, sizeof(scratch));
             return receive_finish(out_info, info, error, VIREO_RESULT_INTERNAL, 0, saved_errno);
         }
+        (void)vireo_secure_clear(scratch, sizeof(scratch));
         buffer_info.tail_space -= received;
     }
     return receive_finish(out_info, info, error, VIREO_OK, 0, saved_errno);

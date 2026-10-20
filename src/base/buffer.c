@@ -1,18 +1,19 @@
 /*
- * PROJECT : VIREO
- * FILE    : buffer.c
- * AUTHOR  : bitofux
- * DATE    : 2026-10-01
- * BRIEF   : 此模块负责：
- * -- 有界连续存储、发布前回滚与唯一资源清理
- * -- 先受检后复制/提交的字节进度核心
- * IMPLEMENTATION :
- * -- 0 <= read_index <= write_index <= capacity；可读区间已初始化
- * -- append 不分配/compact，consume 全空时归零，不使用索引回绕
- * -- reserve/shrink 分配前不移动旧区，成功交接后才释放旧存储
+- PROJECT : VIREO
+- FILE    : buffer.c
+- AUTHOR  : bitofux
+- DATE    : 2026-10-01
+- BRIEF   : 此模块负责：
+- -- 有界连续存储、发布前回滚与唯一资源清理
+- -- 先受检后复制/提交的字节进度核心
+- IMPLEMENTATION :
+- -- 0 <= read_index <= write_index <= capacity；可读区间已初始化
+- -- append 不分配/compact，consume 全空时归零，不使用索引回绕
+- -- reserve/shrink 分配前不移动旧区，成功交接后才释放旧存储
  */
 #include <vireo/base/buffer.h>
 #include <vireo/base/checked.h>
+#include <vireo/base/secure_clear.h>
 #include "buffer_internal.h"
 
 #include <errno.h>
@@ -20,19 +21,26 @@
 #include <string.h>
 
 struct vireo_buffer {
-    uint8_t *data;                     /**< 自有字节分配，可读区外不得公开。 */
-    size_t capacity;                   /**< 当前字节容量，reserve 增长/shrink 回缩。 */
-    size_t read_index;                 /**< 已消费前缀的末端。 */
-    size_t write_index;                /**< 已初始化字节的末端。 */
+    uint8_t *data;                      /**< 自有字节分配，可读区外不得公开。 */
+    size_t capacity;                    /**< 当前字节容量，reserve 增长/shrink 回缩。 */
+    size_t read_index;                  /**< 已消费前缀的末端。 */
+    size_t write_index;                 /**< 已初始化字节的末端。 */
     vireo_buffer_allocator_t allocator; /**< 配对释放操作，context 只借用。 */
 };
 
 /**
  * @brief 将对象内分配器签名适配到标准 malloc
- * @param[in] context 为接口一致性保留，不保存或访问；生产传 NULL。
- * @param[in] size 调用者已验证的正字节数，对象或候选存储的请求大小。
- * @return 独立且适当对齐的自有分配；调用者接管并用 deallocate_default 释放。
- * @retval NULL 无法取得请求内存，不取得资源。
+ *
+ * @param[in] context
+ *     为接口一致性保留，不保存或访问；生产传 NULL。
+ * @param[in] size
+ *     调用者已验证的正字节数，对象或候选存储的请求大小。
+ *
+ * @return
+ *     独立且适当对齐的自有分配；调用者接管并用 deallocate_default 释放。
+ * @retval NULL
+ *     无法取得请求内存，不取得资源。
+ *
  * @note 不初始化字节，不改变其他已发布资源；无共享可变分配设置。
  * @note errno 可能由 malloc 改变；create/replace_storage 负责保存恢复公共入口值。
  */
@@ -43,8 +51,12 @@ static void *allocate_default(void *context, size_t size) {
 
 /**
  * @brief 配对释放标准分配器取得的内存，消费其所有权
- * @param[in] context 不保存或访问；生产传 NULL。
- * @param[in] memory 本适配器分配且未释放的自有内存；调用后不可再使用。
+ *
+ * @param[in] context
+ *     不保存或访问；生产传 NULL。
+ * @param[in] memory
+ *     本适配器分配且未释放的自有内存；调用后不可再使用。
+ *
  * @note 无返回错误、不重入对象；调用者在释放前完成交接或保存清理操作表。
  * @note 不提供安全擦除；不依赖 free 是否保持 errno，公共调用者负责恢复。
  */
@@ -71,6 +83,7 @@ vireo_result_t vireo_buffer_create_with_allocator(size_t capacity,
     }
     uint8_t *data = allocator->allocate(allocator->context, capacity);
     if (data == NULL) {
+        (void)vireo_secure_clear(candidate, sizeof(*candidate));
         allocator->deallocate(allocator->context, candidate);
         errno = saved_errno;
         return VIREO_RESULT_NO_MEMORY;
@@ -102,7 +115,11 @@ vireo_result_t vireo_buffer_destroy(vireo_buffer_t **buffer) {
     vireo_buffer_t *owned = *buffer;
     /* 释放对象前先保存配对操作，避免再读取已经释放的对象字段。 */
     vireo_buffer_allocator_t allocator = owned->allocator;
-    allocator.deallocate(allocator.context, owned->data);
+    uint8_t *data = owned->data;
+    size_t capacity = owned->capacity;
+    (void)vireo_secure_clear(data, capacity);
+    allocator.deallocate(allocator.context, data);
+    (void)vireo_secure_clear(owned, sizeof(*owned));
     allocator.deallocate(allocator.context, owned);
     *buffer = NULL;
     errno = saved_errno;
@@ -161,6 +178,7 @@ vireo_result_t vireo_buffer_consume(vireo_buffer_t *buffer, size_t size) {
     if (result != VIREO_OK) {
         return result;
     }
+    (void)vireo_secure_clear(buffer->data + buffer->read_index, size);
     buffer->read_index += size;
     if (buffer->read_index == buffer->write_index) {
         buffer->read_index = 0;
@@ -178,6 +196,8 @@ vireo_result_t vireo_buffer_compact(vireo_buffer_t *buffer) {
     if (readable != 0 && buffer->read_index != 0) {
         memmove(buffer->data, buffer->data + buffer->read_index, readable);
     }
+    /* 搬移完成后只清新有效区外的旧尾，不能清整个旧源区。 */
+    (void)vireo_secure_clear(buffer->data + readable, buffer->write_index - readable);
     buffer->read_index = 0;
     buffer->write_index = readable;
     return VIREO_OK;
@@ -185,12 +205,19 @@ vireo_result_t vireo_buffer_compact(vireo_buffer_t *buffer) {
 
 /**
  * @brief 在容量计划已验证后执行完整存储交接，供 reserve/shrink 共享
- * @param[in,out] buffer 非空存活且独占的对象，allocator 配对有效且不可重入。
- * @param[in] capacity 1..硬上限且不少于未读长度，由调用者完成边界/受检计算。
- * @retval VIREO_OK 对象接管独立新区，r=0/w=未读长度，旧区已配对释放。
- * @retval VIREO_RESULT_NO_MEMORY 分配失败，全部旧区/字段/view 保持。
- * @note candidate 在提交前局部拥有；提交后由 buffer 拥有。只复制非空未读区；
- *     不先整理旧区。对象/allocator 不变，成功结束 view，所有路径保持 errno。
+ *
+ * @param[in,out] buffer
+ *     非空存活且独占的对象，allocator 配对有效且不可重入。
+ * @param[in] capacity
+ *     1..硬上限且不少于未读长度，由调用者完成边界/受检计算。
+ *
+ * @retval VIREO_OK
+ *     对象接管独立新区，r=0/w=未读长度，旧区已配对释放。
+ * @retval VIREO_RESULT_NO_MEMORY
+ *     分配失败，全部旧区/字段/view 保持。
+ *
+ * @note candidate 在提交前局部拥有；提交后由 buffer 拥有。只复制非空未读区；不先整理旧区。
+ *     对象/allocator 不变，成功结束 view，所有路径保持 errno。
  * @note 仅内部已验证调用；释放不可报告失败，不执行 I/O 或日志。
  */
 static vireo_result_t replace_storage(vireo_buffer_t *buffer, size_t capacity) {
@@ -205,10 +232,12 @@ static vireo_result_t replace_storage(vireo_buffer_t *buffer, size_t capacity) {
         memcpy(candidate, buffer->data + buffer->read_index, readable);
     }
     uint8_t *old_data = buffer->data;
+    size_t old_capacity = buffer->capacity;
     buffer->data = candidate;
     buffer->capacity = capacity;
     buffer->read_index = 0;
     buffer->write_index = readable;
+    (void)vireo_secure_clear(old_data, old_capacity);
     buffer->allocator.deallocate(buffer->allocator.context, old_data);
     errno = saved_errno;
     return VIREO_OK;

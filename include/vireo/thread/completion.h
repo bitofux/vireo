@@ -263,6 +263,8 @@ vireo_result_t vireo_completion_move(vireo_completion_t **source,
  *
  * @note
  *     不调用业务清理函数、不取消或发送；所有旧裸指针别名失效但不会自动清零。
+ *     配对释放前擦除整块自有申请（控制块及响应字节）；原输入和其他副本仍由 caller 清理。
+ *     擦除成本 O(allocated_bytes)，不承诺硬实时，不保证第三方或系统副本清除。
  *     无内部同步，caller 保证寿命，所有路径保持入口 errno。
  */
 vireo_result_t vireo_completion_destroy(vireo_completion_t **owner);

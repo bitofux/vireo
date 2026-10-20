@@ -19,6 +19,7 @@
  *     allocate 返回全新、足量、正确对齐的独占内存或 NULL；deallocate 必须释放原块。
  *     两 callback 不得递归访问正在创建/销毁的 task 或破坏调用者输出。
  *     context 只借用，须存活且适当同步直到所有相关 task 销毁。
+ *     销毁时先擦除整块再 deallocate；context 必须在块外，deallocate 不得依赖原字段。
  */
 typedef struct vireo_task_allocator {
     void *context; /**< callback 借用上下文，可 NULL，不由 task 释放。 */

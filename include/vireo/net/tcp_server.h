@@ -561,7 +561,8 @@ typedef enum vireo_tcp_server_client_stage {
     VIREO_TCP_SERVER_CLIENT_FLOW_REFRESH = 22, /**< 水位刷新依赖失败。 */
     VIREO_TCP_SERVER_CLIENT_FLOW_DISABLE = 23, /**< 停用策略依赖失败。 */
     VIREO_TCP_SERVER_CLIENT_REQUEST_CLOSE = 24, /**< 关闭请求依赖失败；意图可能已提交。 */
-    VIREO_TCP_SERVER_CLIENT_CLOSE_REFRESH = 25 /**< 关闭刷新依赖失败；逻辑阶段可能已变化。 */
+    VIREO_TCP_SERVER_CLIENT_CLOSE_REFRESH = 25, /**< 关闭刷新依赖失败；逻辑阶段可能已变化。 */
+    VIREO_TCP_SERVER_CLIENT_QUERY_PEER = 26 /**< 当前租约的真实socket对端查询失败。 */
 } vireo_tcp_server_client_stage_t;
 
 /** 各依赖原诊断独立保存，未参与字段语义为零；没有资源所有权。 */
@@ -661,6 +662,41 @@ vireo_result_t vireo_tcp_server_admit_batch(vireo_tcp_server_t *server,
  */
 vireo_result_t vireo_tcp_server_client_inspect(vireo_tcp_server_t const *server,
     vireo_connection_pool_lease_t client, vireo_tcp_server_client_info_t *out_info);
+
+/**
+ * @brief 先验证当前客户完整租约，再查询其唯一socket的对端IP快照。
+ *
+ * @param[in] server
+ *     必需存活资源根，Reactor短借至返回，不借出pool/connection/fd。
+ * @param[in] client
+ *     本server当前客户的pool/slot/generation，逐项按原lookup核验。
+ * @param[out] peer
+ *     必需独立输出，仅成功整体提交，任何失败全部字节保持。
+ * @param[out] error
+ *     可空独立诊断，每可写路径覆盖；无清理责任。
+ *
+ * @retval VIREO_OK
+ *     取得当前客户IPv4/IPv6快照；不是TLS或账号认证证明。
+ * @retval VIREO_RESULT_INVALID_ARGUMENT
+ *     必需NULL、畸形或跨池租约。
+ * @retval VIREO_RESULT_RANGE
+ *     同池槽号越界。
+ * @retval VIREO_RESULT_NOT_FOUND
+ *     空/旧代租约，或有效客户没有IP地址（AF_UNIX）。
+ * @retval VIREO_RESULT_IO
+ *     原getpeername失败，primary.connection_error保留原系统原因。
+ * @retval VIREO_RESULT_INTERNAL
+ *     客户元数据不一致或原地址形态异常。
+ *
+ * @note lookup拒绝阶段为LOOKUP，实际查询失败为QUERY_PEER；输入拒绝/成功诊断全零。
+ *       沿connection_peer_query的地址格式/IPv4-mapped规则，无端口、scope或自报字段。
+ *       单次查询、不分配/收发/重试/关闭，不改变客户/队列/关注/读区view，不要求flow绑定。
+ *       保持入口errno；Reactor-only，禁POSIX取消；所有输入输出/资源/errno独立不重叠。
+ *       快照不保活客户；将快照与同一当前完整租约关联后再做登录准入，不能缓存跨代复用。
+ */
+vireo_result_t vireo_tcp_server_client_peer_query(vireo_tcp_server_t const *server,
+    vireo_connection_pool_lease_t client, vireo_connection_peer_t *peer,
+    vireo_tcp_server_client_error_t *error);
 
 /**
  * @brief 显式注销并立即归还客户，消费型关闭 IO 仍退款且清租约

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <openssl/err.h>
 #include <vireo/base/checked.h>
+#include <vireo/base/secure_clear.h>
 
 /**
  * @brief 提交独立诊断并恢复入口errno
@@ -129,10 +130,21 @@ static vireo_tls_io_config_ops_t const config_ops = {
     NULL, allocate, deallocate, buffer_create, buffer_destroy, prepare
 };
 
-/** 可处理部分候选；逆序释放，buffer遵循公开owner合同，scratch使用原配对allocator。 */
+void vireo_tls_io_clear_scratch(vireo_tls_io_storage_t *io)
+{
+    if (io->write_scratch != NULL) {
+        (void)vireo_secure_clear(io->write_scratch, VIREO_TLS_IO_SCRATCH_BYTES);
+    }
+    if (io->read_scratch != NULL) {
+        (void)vireo_secure_clear(io->read_scratch, VIREO_TLS_IO_SCRATCH_BYTES);
+    }
+}
+
+/** 可处理部分候选；先擦暂存再逆序释放，buffer遵循公开owner合同。 */
 void vireo_tls_io_release(vireo_tls_io_storage_t *io)
 {
     vireo_tls_io_config_ops_t resources = io->resources;
+    vireo_tls_io_clear_scratch(io);
     if (io->write_scratch != NULL) { resources.deallocate(resources.context, io->write_scratch); }
     if (io->read_scratch != NULL) { resources.deallocate(resources.context, io->read_scratch); }
     if (io->write_buffer != NULL) { resources.buffer_destroy(resources.context, &io->write_buffer); }
@@ -201,6 +213,7 @@ static vireo_result_t io_setup(vireo_tls_connection_t *connection,
         candidate.write_scratch = ops->allocate(ops->context, VIREO_TLS_IO_SCRATCH_BYTES);
         if (candidate.write_scratch == NULL) { result = VIREO_RESULT_NO_MEMORY; }
     }
+    if (result == VIREO_OK) { vireo_tls_io_clear_scratch(&candidate); }
     if (result == VIREO_OK && !ops->prepare(ops->context, connection->native)) {
         bool oom = capture(&diagnostic);
         result = oom ? VIREO_RESULT_NO_MEMORY : VIREO_RESULT_INTERNAL;
@@ -394,7 +407,7 @@ vireo_tls_io_ops_t const vireo_tls_io_native_ops = {NULL, sigpipe_ignored, read_
  * @param[in,out] io 非空OPEN存储，本次才第一次fatal。
  * @param[in] result 非OK原生失败分类。
  * @param[in] diagnostic 清理前保存的值诊断。
- * @note 不改握手四态/缓存，不释放明文；快照留到destroy，不再网络重试。
+ * @note 不改握手四态/缓存，不释放FIFO；不再网络重试，暂存清零，数值快照留到destroy。
  */
 static void fail(vireo_tls_io_storage_t *io, vireo_result_t result,
     vireo_tls_connection_error_t diagnostic)
@@ -404,6 +417,7 @@ static void fail(vireo_tls_io_storage_t *io, vireo_result_t result,
     io->failure_error = diagnostic;
     io->resume_read = false;
     io->resume_write = false;
+    vireo_tls_io_clear_scratch(io);
 }
 
 /** 两个正值取小，避免不必要的带符号窄化。 */
@@ -523,6 +537,7 @@ static vireo_result_t io_drive(vireo_tls_connection_t *connection,
                 if (info.tail_space < confirmed) { (void)vireo_buffer_compact(buffer); }
                 result = vireo_buffer_append(buffer, scratch, confirmed);
             }
+            (void)vireo_secure_clear(scratch, VIREO_TLS_IO_SCRATCH_BYTES);
             *retry = 0; *wait = VIREO_TLS_IO_WAIT_NONE;
             if (result != VIREO_OK) { result = VIREO_RESULT_INTERNAL; }
             else {
@@ -537,6 +552,7 @@ static vireo_result_t io_drive(vireo_tls_connection_t *connection,
             diagnostic = (vireo_tls_connection_error_t){0};
             break;
         } else if (returned == 0 && classification == SSL_ERROR_ZERO_RETURN && !writing) {
+            (void)vireo_secure_clear(scratch, VIREO_TLS_IO_SCRATCH_BYTES);
             io->read_eof = true; *retry = 0; *wait = VIREO_TLS_IO_WAIT_NONE;
             progress.stop_reason = VIREO_TLS_IO_STOP_PEER_EOF;
             diagnostic = (vireo_tls_connection_error_t){0};

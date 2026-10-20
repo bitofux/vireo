@@ -183,7 +183,7 @@ static int check_overlapping_compact(void) {
     errno = EACCES;
     CHECK(vireo_buffer_compact(buffer) == VIREO_OK && errno == EACCES);
     CHECK(check_info(buffer, 8, 7, 1) == 0 && check_bytes(buffer, sample + 1, 7) == 0);
-    CHECK(fixture.data[7] == sample[7]); /* 不宣称擦除旧内容。 */
+    CHECK(fixture.data[7] == 0); /* 新合同：搬移后旧尾写零，七字节有效区保持。 */
     CHECK(fixture.calls == 2 && fixture.releases == 0);
     CHECK(vireo_buffer_append(buffer, sample, 1) == VIREO_OK);
     uint8_t const expected[8] = {0, 0x42, 0x43, 0x44, 0x80, 0xFE, 0xFF, 0x41};

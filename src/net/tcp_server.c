@@ -1603,6 +1603,25 @@ vireo_result_t vireo_tcp_server_admit_batch(vireo_tcp_server_t *server,
     return admit_clients(server, options, budget, out_clients, capacity, out_info, error, false);
 }
 
+vireo_result_t vireo_tcp_server_client_peer_query(vireo_tcp_server_t const *server,
+    vireo_connection_pool_lease_t client, vireo_connection_peer_t *peer,
+    vireo_tcp_server_client_error_t *error)
+{
+    int const saved_errno = errno;
+    vireo_tcp_server_client_error_t detail = {0};
+    if (server == NULL || peer == NULL)
+        return client_finish(VIREO_RESULT_INVALID_ARGUMENT, &detail, error, saved_errno);
+    vireo_connection_t *connection = NULL;
+    vireo_result_t result = find_client(server, client, &connection);
+    if (result != VIREO_OK) {
+        detail.primary.stage = VIREO_TCP_SERVER_CLIENT_LOOKUP;
+        return client_finish(result, &detail, error, saved_errno);
+    }
+    result = vireo_connection_peer_query(connection, peer, &detail.primary.connection_error);
+    if (result != VIREO_OK) detail.primary.stage = VIREO_TCP_SERVER_CLIENT_QUERY_PEER;
+    return client_finish(result, &detail, error, saved_errno);
+}
+
 vireo_result_t vireo_tcp_server_client_inspect(vireo_tcp_server_t const *server,
     vireo_connection_pool_lease_t client, vireo_tcp_server_client_info_t *out_info)
 {

@@ -849,4 +849,12 @@ vireo_result_t vireo_tls_connection_close_step_at(vireo_tls_connection_t *connec
 vireo_result_t vireo_tls_connection_close_inspect(vireo_tls_connection_t const *connection,
     vireo_tls_close_info_t *out_info, vireo_tls_connection_error_t *error);
 
+/**
+ * 应用暂存生命周期：Vireo自有read/write scratch在确认完成/读EOF后清零对应整块，
+ * 应用fatal、关闭COMPLETE/FAILED及释放前清零两块。WANT和可恢复前置拒绝保持pending暂存；
+ * 关闭终态仍保留未消费FIFO供caller处理，终态retry数值只作历史快照，不能继续native。
+ * FIFO消费/整理/释放沿buffer清理合同；caller输入/workspace与OpenSSL/内核内部副本另负责任。
+ * 清理保持errno，增加线性写零成本，不提供锁页或崩溃后全秘密清理保证。
+ */
+
 #endif

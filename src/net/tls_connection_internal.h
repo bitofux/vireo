@@ -83,8 +83,8 @@ typedef struct vireo_tls_io_storage {
     size_t buffer_bytes; /**< 四个字节资源请求和。 */
     vireo_buffer_t *read_buffer; /**< 唯一公开buffer owner。 */
     vireo_buffer_t *write_buffer; /**< 唯一公开buffer owner，前缀确认才consume。 */
-    uint8_t *read_scratch; /**< 固定16KiB，跨read WANT稳定。 */
-    uint8_t *write_scratch; /**< 固定16KiB，跨write WANT内容稳定。 */
+    uint8_t *read_scratch; /**< 固定16KiB，跨read WANT稳定；确认复制/EOF/终态后清零。 */
+    uint8_t *write_scratch; /**< 固定16KiB，跨write WANT内容稳定；确认消费/终态后清零。 */
     vireo_tls_io_config_ops_t resources; /**< 保活配对资源回调/context。 */
     size_t read_retry_bytes; /**< 未完成原请求长度，无请求0。 */
     size_t write_retry_bytes; /**< 未完成原快照长度，无请求0。 */
@@ -173,6 +173,13 @@ vireo_result_t vireo_tls_connection_handshake_with_ops(vireo_tls_connection_t *c
 vireo_result_t vireo_tls_connection_handshake_at_with_ops(vireo_tls_connection_t *connection,
     vireo_monotonic_ns_t now, vireo_tls_handshake_info_t *out_info,
     vireo_tls_connection_error_t *error, vireo_tls_handshake_ops_t const *ops);
+
+/**
+ * @brief 清两块自有暂存，允许部分构造；不改FIFO或数值快照
+ * @param[in,out] io 非空独占存活存储；每个非空scratch须指向完整16KiB自有区。
+ * @note 仅资源初始化/释放或不再重试的终态调用；不得对活跃WANT调用。保持errno。
+ */
+void vireo_tls_io_clear_scratch(vireo_tls_io_storage_t *io);
 
 /** 释放已配置或未发布候选资源；无网络，owner均清空，资源表保持到释放结束。 */
 void vireo_tls_io_release(vireo_tls_io_storage_t *io);

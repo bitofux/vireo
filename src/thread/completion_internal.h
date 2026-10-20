@@ -18,6 +18,7 @@
  * @note
  *     allocate 返回全新、足量、正确对齐的独占块或 NULL；deallocate 释放原块且无失败返回。
  *     callback 不重入或破坏构造/销毁及输出；context 借到所有相关对象销毁，须适当同步。
+ *     销毁时先擦除整块再 deallocate；context 必须在块外，deallocate 不得依赖原字段。
  */
 typedef struct vireo_completion_allocator {
     void *context; /**< 分配操作借用上下文，可 NULL，不由 completion 释放。 */

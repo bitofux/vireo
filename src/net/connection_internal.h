@@ -12,6 +12,15 @@
 
 #include <vireo/net/connection.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+
+/** 仅本组件测试的单次查询seam；借context到返回，不保存，不改变connection布局。
+ * get_peer遵循getpeername的0/-1、长度和errno合同；异常成功形态用于防御测试。
+ */
+typedef int (*vireo_connection_peer_query_fn)(void *, int, struct sockaddr *, socklen_t *);
+vireo_result_t vireo_connection_peer_query_with(vireo_connection_t const *connection,
+    vireo_connection_peer_t *peer, vireo_connection_error_t *error,
+    vireo_connection_peer_query_fn get_peer, void *context);
 
 /**
  * 仅本模块测试使用，逐对象按值复制，无全局可变 hooks；context 借用至 destroy 返回。

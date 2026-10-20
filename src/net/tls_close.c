@@ -142,7 +142,7 @@ vireo_result_t vireo_tls_connection_close_request(vireo_tls_connection_t *connec
  * @param[in] result 本次非OK原生失败或TIMEOUT。
  * @param[in] diagnostic 已完成分类/捕获的独立值诊断。
  *
- * @note 调用者保证只在首错前调用；不清缓冲、不释放资源、不改握手历史。
+ * @note 调用者保证只在首错前调用；清两块暂存，保留FIFO、不释放资源、不改握手历史。
  *     清shutdown_wait使终态没有后续重试，网络门禁由close FAILED统一生效。
  */
 static void fail(vireo_tls_connection_t *connection, vireo_result_t result,
@@ -152,6 +152,7 @@ static void fail(vireo_tls_connection_t *connection, vireo_result_t result,
     connection->close.failure_result = result;
     connection->close.failure_error = diagnostic;
     connection->close.shutdown_wait = VIREO_TLS_IO_WAIT_NONE;
+    vireo_tls_io_clear_scratch(&connection->io);
 }
 
 /**
@@ -305,7 +306,10 @@ vireo_result_t vireo_tls_connection_close_with_ops(vireo_tls_connection_t *conne
         }
     }
     close->last_now_ns = now;
-    if (close->state == VIREO_TLS_CLOSE_COMPLETE) { progress.stop_reason = VIREO_TLS_CLOSE_STOP_COMPLETE; }
+    if (close->state == VIREO_TLS_CLOSE_COMPLETE) {
+        vireo_tls_io_clear_scratch(io);
+        progress.stop_reason = VIREO_TLS_CLOSE_STOP_COMPLETE;
+    }
     progress.info = snapshot(connection);
     *out_progress = progress;
     return finish(error, diagnostic, result, saved_errno, true);

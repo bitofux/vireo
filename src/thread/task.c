@@ -9,6 +9,7 @@
 #include "task_internal.h"
 
 #include <vireo/base/checked.h>
+#include <vireo/base/secure_clear.h>
 
 #include <errno.h>
 #include <stdlib.h>
@@ -231,8 +232,10 @@ vireo_result_t vireo_task_destroy(vireo_task_t **owner) {
             errno = saved_errno;
             return result;
         }
-        /* 先复制操作表，释放后不读取 task；owner 必须在对象外。 */
+        /* 取消引用先释放成功；先保存操作表和长度，擦除后不再读取 task 字段。 */
         vireo_task_allocator_t const allocator = (*owner)->allocator;
+        size_t const allocated_bytes = (*owner)->allocated_bytes;
+        (void)vireo_secure_clear(*owner, allocated_bytes);
         allocator.deallocate(allocator.context, *owner);
     }
     *owner = NULL;

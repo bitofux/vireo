@@ -9,6 +9,7 @@
 #include "completion_internal.h"
 
 #include <vireo/base/checked.h>
+#include <vireo/base/secure_clear.h>
 
 #include <errno.h>
 #include <stdlib.h>
@@ -142,6 +143,9 @@ vireo_result_t vireo_completion_destroy(vireo_completion_t **owner) {
     int const saved_errno = errno;
     vireo_completion_t *completion = *owner;
     vireo_completion_allocator_t const operations = completion->allocator;
+    size_t const allocated_bytes = completion->allocated_bytes;
+    /* 操作表在块外，整块清理后仅将原地址交给配对释放器。 */
+    (void)vireo_secure_clear(completion, allocated_bytes);
     operations.deallocate(operations.context, completion);
     *owner = NULL;
     errno = saved_errno;
