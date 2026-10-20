@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -125,6 +126,12 @@ static inline size_t request_frame(unsigned char wire[156],bool login,uint32_t s
     EXPECT(vireo_protocol_frame_crc32c_calculate(wire,32,wire+32,w.used,&h.crc32c),VIREO_OK);
     EXPECT(vireo_protocol_header_encode(&h,wire,32),VIREO_OK); return 32+w.used;
 }
+/* TLS记录可受网络调度影响；轮数不是经过的时间。每次完整收发共用5秒期限。 */
+static inline uint64_t io_now_ns(void) {
+    struct timespec now;
+    REQUIRE(clock_gettime(CLOCK_MONOTONIC,&now)==0);
+    return (uint64_t)now.tv_sec*UINT64_C(1000000000)+(uint64_t)now.tv_nsec;
+}
 static inline void receive_wire(fixture_t *f,uint8_t const *wire,size_t n,uint8_t const **input) {
     size_t wrote=0;
     for(unsigned k=0;k<1024 && wrote<n;++k) {
@@ -134,12 +141,14 @@ static inline void receive_wire(fixture_t *f,uint8_t const *wire,size_t n,uint8_
         wrote+=amount;
     }
     REQUIRE(wrote==n);
-    size_t have=0;
-    for(unsigned k=0;k<1024 && have<n;++k) {
+    size_t have=0; uint64_t const deadline=io_now_ns()+UINT64_C(5000000000);
+    while(have<n && io_now_ns()<deadline) {
         vireo_tls_io_budget_t const b={4096,8}; vireo_tls_io_progress_t progress;
         EXPECT(vireo_tls_connection_receive(tls(f),&b,&progress,NULL),VIREO_OK);
         EXPECT(vireo_tcp_server_client_read_peek(f->server,f->client,input,&have,NULL),VIREO_OK);
         if(have<n) {
+            vireo_tcp_server_tls_flow_info_t flow;
+            EXPECT(vireo_tcp_server_client_tls_flow_refresh(f->server,f->client,&flow,NULL),VIREO_OK);
             vireo_tcp_server_ready_client_t ready[1]; vireo_tcp_server_tls_poll_report_t p;
             EXPECT(vireo_tcp_server_tls_poll_ready_once(f->server,2,1,ready,1,&p,NULL),VIREO_OK);
         }
@@ -148,14 +157,20 @@ static inline void receive_wire(fixture_t *f,uint8_t const *wire,size_t n,uint8_
 }
 
 static inline void drain(fixture_t *f,uint8_t *out,size_t size) {
-    size_t received=0;
-    for(unsigned k=0;k<4096 && received<size;++k) {
+    size_t received=0; uint64_t const deadline=io_now_ns()+UINT64_C(5000000000);
+    while(received<size && io_now_ns()<deadline) {
         vireo_tls_io_budget_t const budget={4096,8}; vireo_tls_io_progress_t progress;
         EXPECT(vireo_tls_connection_send(tls(f),&budget,&progress,NULL),VIREO_OK);
         size_t amount=0; ERR_clear_error(); int rc=SSL_read_ex(f->ssl,out+received,size-received,&amount);
         int why=rc==1?SSL_ERROR_NONE:SSL_get_error(f->ssl,rc);
         REQUIRE(why==SSL_ERROR_NONE || why==SSL_ERROR_WANT_READ || why==SSL_ERROR_WANT_WRITE);
-        received+=amount; if(!amount) REQUIRE(sched_yield()==0);
+        received+=amount;
+        if(!amount) {
+            struct pollfd peer={f->peer,why==SSL_ERROR_WANT_WRITE?POLLOUT:POLLIN,0};
+            int const polled=poll(&peer,1,5);
+            REQUIRE(polled>=0 || errno==EINTR);
+            REQUIRE(!(peer.revents&(POLLERR|POLLHUP|POLLNVAL)));
+        }
     }
     REQUIRE(received==size);
 }
