@@ -158,7 +158,10 @@ static void scenarios(vireo_mysql_runtime_t *runtime,vireo_mysql_thread_t *threa
     EXPECT(vireo_auth_session_lookup(t.f.sessions,old,handle,utc_ms(),&bound),VIREO_OK);
     baseline=sessions(thread,observer);
     request(&t,true,30,false);request(&t,true,31,false);
-    for(size_t i=0;i<4096 && t.submitted<3;++i)(void)service_turn(&t);REQUIRE(t.submitted==3);
+    for(size_t i=0;i<4096 && t.submitted<3;++i) {
+        (void)service_turn(&t);
+    }
+    REQUIRE(t.submitted==3);
     EXPECT(vireo_auth_service_quiesce(t.service),VIREO_OK);REQUIRE(sem_post(&c->release)==0);
     uint64_t now=0,until=0;EXPECT(vireo_clock_monotonic_now(&now,NULL),VIREO_OK);until=now+UINT64_C(10000000000);
     bool committed=false;

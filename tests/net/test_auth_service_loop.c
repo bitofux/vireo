@@ -87,7 +87,10 @@ static void queue_full(void)
     REQUIRE(atomic_load(&w.calls)==1);
     int waited; do { waited=sem_wait(&w.entered); } while(waited==-1 && errno==EINTR); REQUIRE(waited==0);
     n=request_frame(request,false,31,false); peer_write(&t,request,n);
-    for(size_t i=0;i<32 && t.submitted<2;++i) (void)service_turn(&t); REQUIRE(t.submitted==2);
+    for(size_t i=0;i<32 && t.submitted<2;++i) {
+        (void)service_turn(&t);
+    }
+    REQUIRE(t.submitted==2);
     n=request_frame(request,false,32,false); peer_write(&t,request,n);
     vireo_auth_response_t v=service_response(&t,32); REQUIRE(v.sequence==32 && v.status==VIREO_STATUS_OVERLOADED);
     REQUIRE(t.rejected==1 && t.submitted==2 && atomic_load(&w.calls)==1);
@@ -111,7 +114,10 @@ static void backpressure_and_quiesce(void)
 {
     worker_t w; service_fixture_t t; setup_worker(&w,&t); atomic_store(&w.hold,true);
     unsigned char request[156]; size_t n=request_frame(request,true,40,false); peer_write(&t,request,n);
-    for(size_t i=0;i<1024 && !atomic_load(&w.calls);++i) (void)service_turn(&t); REQUIRE(atomic_load(&w.calls)==1);
+    for(size_t i=0;i<1024 && !atomic_load(&w.calls);++i) {
+        (void)service_turn(&t);
+    }
+    REQUIRE(atomic_load(&w.calls)==1);
     int waited; do { waited=sem_wait(&w.entered); } while(waited==-1 && errno==EINTR); REQUIRE(waited==0);
     unsigned char filler[4096],copy[4096]; memset(filler,0xa5,sizeof filler);
     EXPECT(vireo_tcp_server_client_write_enqueue(t.f.server,t.client,filler,sizeof filler,NULL),VIREO_OK);

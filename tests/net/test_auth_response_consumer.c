@@ -143,7 +143,10 @@ typedef struct random_script { uint32_t value; int result; unsigned calls; } ran
 static int random_test(void *context,unsigned char out[4])
 {
     random_script_t *s=context; ++s->calls;
-    for(size_t i=0;i<4;++i) out[i]=(unsigned char)(s->value>>((3-i)*8)); errno=EIO; return s->result;
+    for(size_t i=0;i<4;++i) {
+        out[i]=(unsigned char)(s->value>>((3-i)*8));
+    }
+    errno=EIO; return s->result;
 }
 static void sessions(void)
 {
