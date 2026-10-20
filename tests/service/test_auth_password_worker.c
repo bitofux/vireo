@@ -14,6 +14,39 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+static uint64_t now_ns(void)
+{
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+/* 真实worker可能同时领取；只重试合同允许的锁竞争，不复制或重复执行任务。 */
+static void submit_task(vireo_thread_pool_t *pool, vireo_task_t **task)
+{
+    uint64_t const deadline = now_ns() + UINT64_C(5000000000);
+    vireo_task_t *const original = *task;
+    for (;;) {
+        vireo_thread_pool_submit_report_t submit;
+        vireo_result_t const result = vireo_thread_pool_try_submit(pool, task, &submit);
+        assert(submit.queue_called);
+        if (result == VIREO_OK) {
+            assert(*task == NULL && submit.queue_report.transferred &&
+                submit.stage == VIREO_THREAD_POOL_SUBMIT_STAGE_NONE);
+            return;
+        }
+        assert(result == VIREO_RESULT_BUSY && *task == original &&
+            !submit.queue_report.transferred &&
+            submit.stage == VIREO_THREAD_POOL_SUBMIT_STAGE_SUBMIT_QUEUE &&
+            submit.queue_report.stage == VIREO_TASK_QUEUE_STAGE_LOCK &&
+            submit.queue_report.pthread_error == EBUSY);
+        assert(now_ns() < deadline);
+        struct timespec const pause = {0, 1000000};
+        assert(nanosleep(&pause, NULL) == 0 || errno == EINTR);
+    }
+}
 
 typedef struct worker_fixture {
     pthread_t manager; /**< 管理端身份，证明业务入口在真实worker运行。 */
@@ -93,8 +126,7 @@ int main(void)
         vireo_task_t *task = NULL;
         assert(vireo_task_create_copy(metadata, bytes, i == 0 ? 8 : 64, 4096, &task) == VIREO_OK);
         OPENSSL_cleanse(bytes, sizeof(bytes));
-        vireo_thread_pool_submit_report_t submit;
-        assert(vireo_thread_pool_try_submit(pool, &task, &submit) == VIREO_OK && task == NULL);
+        submit_task(pool, &task);
     }
     vireo_thread_pool_shutdown_report_t shutdown;
     assert(vireo_thread_pool_shutdown_and_join(pool, VIREO_TASK_QUEUE_DRAIN, &shutdown) == VIREO_OK);
