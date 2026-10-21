@@ -73,6 +73,12 @@
 #define VIREO_MYSQL_SCHEMA_AUDIT_ACTION_LOGOUT 3
 /** @brief 恢复Session动作。 */
 #define VIREO_MYSQL_SCHEMA_AUDIT_ACTION_SESSION_RESUME 4
+/** @brief 创建虚拟目录动作；成功审计与新节点同事务。 */
+#define VIREO_MYSQL_SCHEMA_AUDIT_ACTION_NODE_MKDIR 5
+/** @brief 移动／重命名成功审计动作；与节点更新同事务。 */
+#define VIREO_MYSQL_SCHEMA_AUDIT_ACTION_NODE_MOVE UINT32_C(6)
+/** @brief 节点软删除成功审计动作；与节点状态和文件活动引用数同事务。 */
+#define VIREO_MYSQL_SCHEMA_AUDIT_ACTION_NODE_SOFT_DELETE UINT32_C(7)
 /** @brief 无已知目标；id/hash均NULL。 */
 #define VIREO_MYSQL_SCHEMA_AUDIT_TARGET_NONE 0
 /** @brief 用户历史身份；正id且hash NULL。 */

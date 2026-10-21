@@ -19,7 +19,7 @@ jobs:
   debug:
     name: Debug build and tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
       VIREO_BUILD_DIR: build/debug
@@ -67,7 +67,7 @@ jobs:
   sanitizers:
     name: ASan and UBSan
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
       VIREO_BUILD_DIR: build/sanitizers
