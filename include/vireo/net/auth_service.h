@@ -11,7 +11,8 @@
 #include <vireo/net/notifier_server.h>
 #include <vireo/net/inflight_client_cleanup.h>
 
-/** Reactor独占owner；所有依赖须更长寿，不拥有worker或数据库。 */
+/** 原create为四命令；directory_stat_reactor.h的新factory显式启用STAT并复用本服务轮。
+ * Reactor独占owner；所有依赖须更长寿，不拥有worker或数据库。 */
 typedef struct vireo_auth_service vireo_auth_service_t;
 /** 长期借用关联；queue仅含同一operation注册表的可信认证结果。 */
 typedef struct vireo_auth_service_resources {

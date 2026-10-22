@@ -26,11 +26,12 @@ static void observe_audit(void *context,vireo_auth_failure_audit_info_t const *i
 }
 int main(int argc,char **argv)
 {
-    if (argc==12 && !strcmp(argv[1],"--child")) {
+    if ((argc==12 || argc==13) && !strcmp(argv[1],"--child")) {
         size_t const before=fds();
         bool reported=false;
         vireo_auth_process_options_t const o={argv[2],(uint16_t)strtoul(argv[3],NULL,10),argv[4],argv[5],argv[6],argv[7],argv[8],argv[9],
-            (uint64_t)strtoull(argv[10],NULL,10),(size_t)strtoull(argv[11],NULL,10),observe_audit,&reported};
+            (uint64_t)strtoull(argv[10],NULL,10),(size_t)strtoull(argv[11],NULL,10),observe_audit,&reported,
+            argc==13?(size_t)strtoull(argv[12],NULL,10):4096};
         vireo_auth_process_report_t r; errno=EDOM;
         vireo_result_t rc=vireo_auth_process_run(&o,&r);
         if (errno!=EDOM) abort();
@@ -38,6 +39,8 @@ int main(int argc,char **argv)
         fprintf(stderr,"auth_process child result=%d phase=%d ready=%d clean=%d signal=%d faults_at_stop=%u final_faults=%u created=%zu joined=%zu worker=%d cleanup=%d fd_before=%zu fd_after=%zu\n",
             (int)rc,(int)r.phase,r.ready,r.clean,r.stop_signal,r.faults_at_stop,r.final_faults,r.created_count,r.joined_count,
             (int)r.first_worker_result,(int)r.cleanup_result,before,after);
+        fprintf(stderr,"stat_faults_at_stop=%u stat_final_faults=%u queues_closed=%u queues_drained=%u final_drain_turns=%zu\n",
+            r.stat_faults_at_stop,r.stat_final_faults,r.queues_closed,r.queues_drained,r.final_drain_turns);
         fprintf(stderr,"audit_disabled=%d audit_result=%d audit_created=%d audit_joined=%d audit_queued=%llu audit_taken=%llu audit_discarded=%llu audit_committed=%llu audit_failed=%llu audit_unknown=%llu\n",
             r.audit_writer.disabled,(int)r.audit_writer.first_result,r.audit_writer.created,r.audit_writer.joined,
             (unsigned long long)r.audit_queue.queued,(unsigned long long)r.audit_queue.taken,
@@ -46,6 +49,7 @@ int main(int argc,char **argv)
         if (before!=after || !r.clean || r.created_count!=r.joined_count ||
             r.audit_writer.created!=r.audit_writer.joined ||
             r.audit_queue.queued!=r.audit_queue.taken+r.audit_queue.discarded_on_close) abort();
+        if (r.ready && (r.queues_closed!=7 || r.queues_drained!=6 || !r.final_drain_turns)) abort();
         return rc==VIREO_OK?0:1;
     }
     if (argc!=5) abort();
