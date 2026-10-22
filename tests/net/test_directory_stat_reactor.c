@@ -68,6 +68,29 @@ static vireo_result_t submit(void *c,vireo_inflight_store_t *s,vireo_tcp_server_
     vireo_result_t rc=m->native.submit(NULL,s,server,pool,max,task,p);
     return m->submit_error && p->pool_report.queue_report.transferred?VIREO_RESULT_IO:rc;
 }
+/** fixture的成功认证也须读取实际帧长，并重试未移交任务的短暂OVERLOADED。 */
+static vireo_auth_response_t auth_request(model_t *m,bool login,uint32_t sequence)
+{
+    uint64_t begin=0,now=0;
+    EXPECT(vireo_clock_monotonic_now(&begin,NULL),VIREO_OK);
+    for(;;) {
+        unsigned char request_wire[156]; size_t n=request_frame(request_wire,login,sequence,false);
+        peer_write(&m->t,request_wire,n);
+        unsigned char wire[104]; peer_read(&m->t,wire,32);
+        vireo_protocol_header_t header; vireo_protocol_codec_issue_t issue;
+        EXPECT(vireo_protocol_header_decode(wire,32,&header,&issue),VIREO_OK);
+        REQUIRE(header.body_len<=sizeof wire-32);
+        peer_read(&m->t,wire+32,header.body_len);
+        vireo_auth_response_t response={0};
+        EXPECT(vireo_auth_response_decode(wire,32+header.body_len,&response),VIREO_OK);
+        REQUIRE(response.sequence==sequence && response.command==(login?VIREO_COMMAND_LOGIN:VIREO_COMMAND_REGISTER));
+        EXPECT(vireo_secure_clear(wire,sizeof wire),VIREO_OK);
+        if(response.status!=VIREO_STATUS_OVERLOADED) return response;
+        EXPECT(vireo_clock_monotonic_now(&now,NULL),VIREO_OK);
+        if(now-begin>=UINT64_C(5000000000)) return response;
+        EXPECT(vireo_auth_response_clear(&response),VIREO_OK);
+    }
+}
 static void setup_model(model_t *m,bool login)
 {
     *m=(model_t){.utc=2,.now=100}; atomic_init(&m->captured_count,0);
@@ -82,17 +105,15 @@ static void setup_model(model_t *m,bool login)
     m->t.service->stat_ops=(vireo_stat_reactor_ops_t){m,clock_utc,clock_now,consume,enqueue,refresh,submit};
     peer_connect(&m->t); m->t.client=m->t.service->slots[0].client;
     if(login) {
-        unsigned char wire[156]; size_t n=request_frame(wire,true,1,false); peer_write(&m->t,wire,n);
-        vireo_auth_response_t response=service_response(&m->t,104); REQUIRE(response.status==VIREO_STATUS_OK);
+        vireo_auth_response_t response=auth_request(m,true,1); REQUIRE(response.status==VIREO_STATUS_OK);
         EXPECT(vireo_auth_response_clear(&response),VIREO_OK);
     }
 }
 static uint32_t handle(model_t *m)
 {
     /* Lookup的handle来自真实LOGIN网络响应；receipt结束后不从Session私有布局读取。 */
-    unsigned char wire[156]; size_t n=request_frame(wire,true,2,false); peer_write(&m->t,wire,n);
-    vireo_auth_response_t r=service_response(&m->t,104); uint32_t h=r.session_handle;
-    REQUIRE(h); EXPECT(vireo_auth_response_clear(&r),VIREO_OK); return h;
+    vireo_auth_response_t r=auth_request(m,true,2); uint32_t h=r.session_handle;
+    REQUIRE(r.status==VIREO_STATUS_OK && h); EXPECT(vireo_auth_response_clear(&r),VIREO_OK); return h;
 }
 /* 只用同net层既有随机接点强制数值handle重用，不读取Session私有布局。 */
 static int same_handle(void *context,unsigned char bytes[4])
@@ -157,6 +178,18 @@ static void wait_task(model_t *m,unsigned count)
 {
     for(size_t i=0;i<4096 && atomic_load_explicit(&m->captured_count,memory_order_acquire)<count;++i) (void)service_turn(&m->t);
     REQUIRE(atomic_load_explicit(&m->captured_count,memory_order_acquire)==count && m->captured);
+}
+/** TLS写入成功不表示对端已收到；按单调期限等事件，不能用空转次数计时。 */
+static vireo_result_t wait_error(vireo_auth_service_t *service,vireo_auth_service_report_t *report)
+{
+    uint64_t begin=0,now=0;
+    EXPECT(vireo_clock_monotonic_now(&begin,NULL),VIREO_OK);
+    do {
+        vireo_result_t const rc=vireo_auth_service_once(service,2,report);
+        if(rc!=VIREO_OK || report->first_client_result!=VIREO_OK) return rc;
+        EXPECT(vireo_clock_monotonic_now(&now,NULL),VIREO_OK);
+    } while(now-begin<UINT64_C(5000000000));
+    return VIREO_OK; /* 调用方仍须断言原先预期的错误与状态。 */
 }
 static void publish(model_t *m)
 {
@@ -224,8 +257,7 @@ static void independent_and_resume(void)
     model_t m; setup_model(&m,true); uint32_t h=handle(&m);
     m.blocked=true; request(&m,30,h); wait_task(&m,1); publish(&m); (void)service_turn(&m.t);
     REQUIRE(m.t.service->stat_receipt.state==1);
-    unsigned char wire[156]; size_t n=request_frame(wire,false,31,false); peer_write(&m.t,wire,n);
-    vireo_auth_response_t auth=service_response(&m.t,56); REQUIRE(auth.sequence==31 && auth.status==VIREO_STATUS_OK);
+    vireo_auth_response_t auth=auth_request(&m,false,31); REQUIRE(auth.sequence==31 && auth.status==VIREO_STATUS_OK);
     REQUIRE(m.t.service->stat_completion && m.t.service->expected_count==1);
     EXPECT(vireo_auth_response_clear(&auth),VIREO_OK);
     m.blocked=false; m.refresh_error=true;
@@ -329,8 +361,8 @@ static void consume_and_transfer(void)
     for(unsigned kind=0;kind<3;++kind) {
         model_t m; setup_model(&m,true); uint32_t h=handle(&m);
         m.consume_error=kind==0; m.submit_error=kind==1; m.rollback_error=kind==2;
-        request(&m,50,h); vireo_auth_service_report_t p; vireo_result_t rc=VIREO_OK;
-        for(size_t i=0;i<4096 && rc==VIREO_OK;++i) rc=vireo_auth_service_once(m.t.service,0,&p);
+        request(&m,50,h); vireo_auth_service_report_t p;
+        vireo_result_t const rc=wait_error(m.t.service,&p);
         REQUIRE(rc==(kind==2?VIREO_RESULT_BUSY:VIREO_RESULT_IO));
         REQUIRE(m.submit_calls==1 && m.t.service->expected_count==1);
         if(kind==0) {
@@ -387,7 +419,7 @@ static void duplicates(void)
         if(kind==2) request(&m,60,h);
         else { unsigned char wire[156]; size_t n=request_frame(wire,true,60,false); peer_write(&m.t,wire,n); }
         vireo_auth_service_report_t p={0};
-        for(size_t i=0;i<4096 && p.first_client_result==VIREO_OK;++i) EXPECT(vireo_auth_service_once(m.t.service,0,&p),VIREO_OK);
+        EXPECT(wait_error(m.t.service,&p),VIREO_OK);
         REQUIRE(p.first_client_result==VIREO_RESULT_PROTOCOL && m.submit_calls==1);
         finish_model(&m);
     }
@@ -428,28 +460,28 @@ static void factories(void)
     EXPECT(vireo_directory_stat_reactor_inspect(NULL,&out),VIREO_RESULT_INVALID_ARGUMENT); REQUIRE(out.submitted==99);
     /* 原四命令factory的STAT不可用由旧模式单独验证；不改旧公共ABI。 */
     finish_model(&m);
-    service_fixture_t t; service_setup(&t,execute,&m);
+    service_setup(&m.t,execute,&m);
     vireo_completion_queue_options_t const qo={1,65536}; EXPECT(vireo_completion_queue_create(&qo,&m.stat),VIREO_OK);
     EXPECT(vireo_completion_queue_prepare_wait(m.stat),VIREO_OK);
-    vireo_auth_service_resources_t const r={t.f.server,t.f.store,t.workers,t.admission,t.f.sessions,t.queue,t.notifier,t.audit};
+    vireo_auth_service_resources_t const r={m.t.f.server,m.t.f.store,m.t.workers,m.t.admission,m.t.f.sessions,m.t.queue,m.t.notifier,m.t.audit};
     vireo_auth_service_options_t o=service_options();
-    for(uint32_t op=100;op<=103;++op) EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.stat,op,&t.service),VIREO_RESULT_INVALID_ARGUMENT);
-    EXPECT(vireo_directory_stat_reactor_create(&r,&o,t.queue,400,&t.service),VIREO_RESULT_INVALID_ARGUMENT);
-    o.max_memory_bytes=1; EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.stat,400,&t.service),VIREO_RESULT_RANGE);
-    service_create(&t); EXPECT(vireo_directory_stat_reactor_inspect(t.service,&out),VIREO_RESULT_NOT_FOUND); REQUIRE(out.submitted==99);
+    for(uint32_t op=100;op<=103;++op) EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.stat,op,&m.t.service),VIREO_RESULT_INVALID_ARGUMENT);
+    EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.t.queue,400,&m.t.service),VIREO_RESULT_INVALID_ARGUMENT);
+    o.max_memory_bytes=1; EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.stat,400,&m.t.service),VIREO_RESULT_RANGE);
+    service_create(&m.t); EXPECT(vireo_directory_stat_reactor_inspect(m.t.service,&out),VIREO_RESULT_NOT_FOUND); REQUIRE(out.submitted==99);
     o=service_options(); vireo_auth_service_t *other=NULL;
     EXPECT(vireo_directory_stat_reactor_create(&r,&o,m.stat,400,&other),VIREO_RESULT_BUSY); REQUIRE(!other);
-    EXPECT(vireo_auth_service_destroy(&t.service),VIREO_OK); /* 失败factory没有注销原owner的唯一绑定。 */
-    service_create(&t);
-    peer_connect(&t); t.client=t.service->slots[0].client;
+    EXPECT(vireo_auth_service_destroy(&m.t.service),VIREO_OK); /* 失败factory没有注销原owner的唯一绑定。 */
+    service_create(&m.t);
+    peer_connect(&m.t); m.t.client=m.t.service->slots[0].client;
     vireo_node_stat_request_t const req={70,0,42}; unsigned char wire[44]; size_t n=0;
-    EXPECT(vireo_node_stat_request_encode(&req,wire,sizeof wire,&n),VIREO_OK); peer_write(&t,wire,n);
+    EXPECT(vireo_node_stat_request_encode(&req,wire,sizeof wire,&n),VIREO_OK); peer_write(&m.t,wire,n);
     vireo_auth_service_report_t p={0};
-    for(size_t i=0;i<4096 && p.first_client_result==VIREO_OK;++i) EXPECT(vireo_auth_service_once(t.service,0,&p),VIREO_OK);
+    EXPECT(wait_error(m.t.service,&p),VIREO_OK);
     REQUIRE(p.first_client_result==VIREO_RESULT_PROTOCOL);
-    for(size_t i=0;i<16;++i) (void)service_turn(&t);
-    peer_free(&t); service_cleanup(&t);
-    EXPECT(vireo_completion_queue_destroy(&m.stat),VIREO_OK);
+    for(size_t i=0;i<16;++i) (void)service_turn(&m.t);
+    /* 复用本测试已确认三queue关闭后join的清理，处理worker短暂持锁。 */
+    finish_model(&m);
 }
 int main(void)
 {
