@@ -6,6 +6,15 @@
 #include <vireo/service/directory_stat_completion.h>
 #include <vireo/net/directory_root_reactor.h>
 #include <vireo/service/directory_root_completion.h>
+#include <vireo/net/auth_service_deadline.h>
+#include <vireo/net/client_deadline.h>
+
+/** 每客户一个timer指向phase/frame的较早期限；完整绑定兼顾两种代次。 */
+typedef struct vireo_auth_client_deadline {
+    vireo_client_deadline_binding_t binding;
+    uint64_t phase_ns, frame_ns;
+    uint32_t authenticated_handle; /**< 只记录consumer实际commit后的handle，无秘密。 */
+} vireo_auth_client_deadline_t;
 
 /** Reactor独占镜像；command非零占槽，提交前只占数值路由，committed才计count。 */
 typedef struct vireo_stat_expected {
@@ -49,6 +58,7 @@ typedef struct client_slot {
     vireo_stat_head_t stat_head; /**< 仅新模式使用。 */
     bool records_cleaned; /**< 原inflight批清理完成，可进入镜像阶段。 */
     size_t expected_cursor; /**< 镜像0..expected_capacity有界清理恢复点。 */
+    vireo_auth_client_deadline_t deadline;
 } client_slot_t;
 /** take后保存独立值，0空/1待enqueue/2待refresh/3待destroy；不再take。 */
 typedef struct vireo_stat_receipt {
@@ -86,6 +96,7 @@ struct vireo_auth_service {
     vireo_auth_service_options_t o;
     vireo_event_loop_handle_t handle;
     size_t capacity,active,sweep,ready_count,ready_next;
+    size_t closing_count; /**< 已标记但尚未release的客户数；清理债禁止poll等待。 */
     bool quiescing;
     client_slot_t *slots;
     vireo_tcp_server_ready_client_t *ready;
@@ -109,7 +120,30 @@ struct vireo_auth_service {
     vireo_directory_root_reactor_report_t root_report;
     vireo_root_reactor_ops_t root_ops;
     unsigned completion_cursor; /**< 六模式轮首0..2。 */
+    vireo_timer_wheel_t *deadline_wheel; /**< 显式启用后长期独占借用，app拥有。 */
+    vireo_auth_service_deadline_options_t deadline_options;
+    vireo_client_deadline_binding_t *deadline_routes; /**< wheel槽仅作索引，随后核验完整身份。 */
+    size_t deadline_capacity;
+    vireo_result_t (*deadline_now)(uint64_t *,vireo_clock_error_t *); /**< 默认公开CLOCK_MONOTONIC；本层测试可替换。 */
 };
+
+/** 本层统一关闭意图，幂等记账；release成功后才归还closing_count。 */
+static inline void vireo_auth_service_close_slot(vireo_auth_service_t *s,client_slot_t *slot)
+{ if(!slot->closing) { slot->closing=true; ++s->closing_count; } }
+
+/* 本层期限操作：均Reactor-only、短借参数、保持外层errno；失败保可清理前缀。
+ * guard先拒绝原到期，再核当前绑定；返回OK时仍可能已标closing，调用者必须检查。
+ * start只在握手成功点调用；frames在receive后且消费前扫描固定FIFO的帧边界，
+ * old_size为receive前读区长度；activity只接受实际绑定/成功交接事实。
+ * pump有界推进并领取，pending时外层停止新业务；cancel先于客户release。
+ * expired只供本层真实历史通知，完整身份不匹配空操作，支持旧代回归验证。 */
+vireo_result_t vireo_auth_deadline_start(vireo_auth_service_t *,client_slot_t *);
+vireo_result_t vireo_auth_deadline_guard(vireo_auth_service_t *,client_slot_t *,vireo_auth_service_report_t *);
+vireo_result_t vireo_auth_deadline_frames(vireo_auth_service_t *,client_slot_t *,size_t,vireo_auth_service_report_t *);
+vireo_result_t vireo_auth_deadline_activity(vireo_auth_service_t *,client_slot_t *,uint32_t,bool,vireo_auth_service_report_t *);
+vireo_result_t vireo_auth_deadline_pump(vireo_auth_service_t *,vireo_auth_service_report_t *);
+vireo_result_t vireo_auth_deadline_cancel(vireo_auth_service_t *,client_slot_t *);
+vireo_result_t vireo_auth_deadline_expired(vireo_auth_service_t *,vireo_timer_wheel_expired_t const *,vireo_auth_service_report_t *);
 /**
  * @brief 初始化本层默认公开操作表，不访问资源
  * @param[out] out 必需存活独占输出，全部字段覆盖。

@@ -103,7 +103,7 @@ vireo_result_t vireo_root_reactor_head(vireo_auth_service_t *s,client_slot_t *sl
 {
     vireo_result_t rc=transport(s,slot->client);
     if(rc!=VIREO_OK) {
-        if(rc==VIREO_RESULT_BUSY || rc==VIREO_RESULT_NOT_FOUND || rc==VIREO_RESULT_CANCELLED) { slot->closing=true; return rc; }
+        if(rc==VIREO_RESULT_BUSY || rc==VIREO_RESULT_NOT_FOUND || rc==VIREO_RESULT_CANCELLED) { vireo_auth_service_close_slot(s,slot); return rc; }
         return fatal(s,rc);
     }
     size_t index=SIZE_MAX;
@@ -178,6 +178,11 @@ static vireo_result_t send_pending(vireo_auth_service_t *s,vireo_auth_service_re
     vireo_root_receipt_t *r=&s->root_receipt;
     vireo_directory_root_completion_outcome_t const *o=&r->outcome;
     vireo_connection_pool_lease_t const client=client_of(o->metadata.request); vireo_result_t rc;
+    if(client.slot_index<s->capacity && same_client(s->slots[client.slot_index].client,client)) {
+        client_slot_t *slot=&s->slots[client.slot_index];
+        rc=vireo_auth_deadline_guard(s,slot,p); if(rc!=VIREO_OK) return rc;
+        if(slot->closing) { ++s->root_report.late_discarded; return vireo_root_reactor_discard(s); }
+    }
     if(r->state==1) {
         if(!matches(expected(s,o->metadata.request),o) || !same_metadata(r->match.metadata,o->metadata.request)) return VIREO_RESULT_INTERNAL;
         rc=transport(s,client);

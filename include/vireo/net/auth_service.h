@@ -52,6 +52,8 @@ typedef struct vireo_auth_service_report {
     vireo_auth_response_consumer_report_t consumer; /**< 最后一次专用consumer报告。 */
     vireo_tcp_server_tls_poll_report_t poll; /**< 本次poll前缀；即使失败selected仍由对象保存。 */
     vireo_tcp_server_tls_error_t tls_error; /**< poll/握手/接入原诊断。 */
+    size_t unauthenticated_timeouts, frame_timeouts, idle_timeouts; /**< 显式启用连接期限后的首次关闭数。 */
+    bool timer_work_pending; /**< 轮仍有追赶/到期债，本次不再推进新业务，下轮不等待。 */
 } vireo_auth_service_report_t;
 /**
  * @brief 固定分配状态及工作区，最后注册通知源，发布唯一服务owner
@@ -101,7 +103,8 @@ vireo_result_t vireo_auth_service_create(vireo_auth_service_resources_t const *r
  *     每客户至多一认证首帧，先send稳定WRITE retry，再READ retry/允许的新读，再head，
  *     最多一次尾send并末flow刷新。EOF须在缓存帧处理后且本客户无inflight/待写/结果时才释放。
  *     quiesce禁新接入/任务，仍处理原消费/拒绝/发送；server_stop则有界放弃/清理旧客户和结果。
- *     本层不执行SQL/KDF/等待队列/阻塞join，不设自动慢端时限；caller可disconnect慢端。
+ *     本层不执行SQL/KDF/等待队列/阻塞join；连接期限由auth_service_deadline.h显式启用，
+ *     未启用时caller负责disconnect慢端。
  *     真实UTC用于Session过期及拒绝审计原样本；可信MONOTONIC产生deadline，两者不能互换。
  *     Reactor-only、禁POSIX取消，所有路径保持errno；SIGPIPE须由进程预设SIG_IGN。
  */

@@ -6,6 +6,7 @@
 #include "auth_worker_runtime.h"
 #include "directory_root_worker_runtime.h"
 #include <vireo/net/auth_service.h>
+#include <vireo/net/auth_service_deadline.h>
 #include <vireo/net/directory_root_reactor.h>
 #include <vireo/persistence/mysql_schema.h>
 #include <vireo/base/secure_clear.h>
@@ -52,6 +53,7 @@ typedef struct process {
     vireo_notifier_t *notifier;
     vireo_auth_login_admission_t *admission;
     vireo_auth_service_t *service;
+    vireo_timer_wheel_t *deadline_wheel; /**< 本线程拥有，服务销毁后才释放。 */
     vireo_auth_worker_runtime_t runtime;
     bool runtime_initialized;
     vireo_directory_stat_worker_runtime_t mixed_runtime;
@@ -266,6 +268,7 @@ static void cleanup(process_t *p,vireo_auth_process_report_t *r)
     for (size_t attempt=0;attempt<3 && p->field;++attempt) cleanup_result(r,(expression)); \
     if (p->field) fatal(); \
 } while (0)
+    RELEASE(deadline_wheel,vireo_timer_wheel_destroy(&p->deadline_wheel));
     RELEASE(workers,vireo_thread_pool_destroy(&p->workers));
     RELEASE(notifier,vireo_notifier_destroy(&p->notifier,NULL));
     RELEASE(root_queue,vireo_completion_queue_destroy(&p->root_queue));
@@ -407,12 +410,21 @@ static vireo_result_t run(process_t *p,vireo_auth_process_options_t const *o,vir
     vireo_acceptor_options_t const listener={4096}; TRY(vireo_acceptor_create(&listener,&p->listener_fd,&p->listener,NULL));
     TRY(vireo_tcp_server_adopt_listener(p->server,&p->listener,NULL)); TRY(vireo_tcp_server_bind_listener(p->server,false,NULL));
     r->phase=VIREO_AUTH_PROCESS_SERVICE;
+    uint64_t timer_origin=0; TRY(vireo_clock_monotonic_now(&timer_origin,NULL));
+    vireo_timer_wheel_options_t const wheel={{timer_origin,UINT64_C(100000000),512},MEMORY};
+    TRY(vireo_timer_wheel_create(&wheel,&p->deadline_wheel));
+    vireo_timer_wheel_registry_options_t const registry={server.connection_capacity,MEMORY};
+    TRY(vireo_timer_wheel_prepare(p->deadline_wheel,&registry));
     vireo_auth_service_resources_t const service={p->server,p->store,p->workers,p->admission,p->sessions,p->queue,p->notifier,p->audit};
     vireo_auth_service_options_t const options={.max_clients=8,.admit={8,16},.max_completions=16,.cleanup_slots=32,
         .receive={4096,8},.send={4096,8},.task_allocation_budget=4096,.max_client_requests=8,
         .register_operation=100,.login_operation=101,.logout_operation=102,.resume_operation=103,.request_timeout_ns=REQUEST_TIMEOUT,.max_memory_bytes=MEMORY};
     if(p->root_queue) { TRY(vireo_directory_root_reactor_create(&service,&options,p->stat_queue,STAT_OPERATION,p->root_queue,ROOT_OPERATION,&p->service)); }
     else { TRY(vireo_directory_stat_reactor_create(&service,&options,p->stat_queue,STAT_OPERATION,&p->service)); }
+    vireo_auth_service_deadline_options_t const deadlines={
+        .unauthenticated_timeout_ns=UINT64_C(30000000000),.frame_timeout_ns=UINT64_C(10000000000),
+        .authenticated_idle_timeout_ns=UINT64_C(60000000000),.advance={64,64},.max_expired=32,.max_memory_bytes=MEMORY};
+    TRY(vireo_auth_service_enable_deadlines(p->service,p->deadline_wheel,&deadlines));
     TRY(stop_signal(p,r));
     if (r->stop_signal) goto done;
     if (fputs("vireo-auth-server ready\n",stdout)==EOF || fflush(stdout)!=0) { rc=VIREO_RESULT_INTERNAL; goto done; }

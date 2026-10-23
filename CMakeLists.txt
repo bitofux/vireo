@@ -1205,10 +1205,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     vireo_target_enable_warnings(vireo_auth_worker)
     vireo_target_enable_sanitizers(vireo_auth_worker)
 
-    add_library(vireo_auth_service_loop STATIC src/net/auth_service.c src/net/directory_stat_reactor.c src/net/directory_root_reactor.c)
+    add_library(vireo_auth_service_loop STATIC src/net/auth_service.c src/net/auth_service_deadline.c src/net/directory_stat_reactor.c src/net/directory_root_reactor.c)
     target_link_libraries(vireo_auth_service_loop PUBLIC vireo_auth_request_rejection
         vireo_auth_response_consumer vireo_notifier_server vireo_inflight vireo_directory_stat_completion vireo_directory_root_completion
-        PRIVATE vireo_checked vireo_clock)
+        PUBLIC vireo_timer_wheel PRIVATE vireo_checked vireo_clock vireo_client_deadline vireo_timer_loop)
     vireo_target_enable_warnings(vireo_auth_service_loop)
     vireo_target_enable_sanitizers(vireo_auth_service_loop)
 
@@ -1355,6 +1355,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         endforeach()
         add_test(NAME vireo_auth_service_loop_test COMMAND vireo_auth_service_loop_test)
         set_tests_properties(vireo_auth_service_loop_test PROPERTIES TIMEOUT 60)
+        add_executable(vireo_auth_service_deadline_test tests/net/test_auth_service_deadline.c)
+        target_link_libraries(vireo_auth_service_deadline_test PRIVATE vireo_auth_service_loop vireo_auth_task_context)
+        vireo_target_enable_warnings(vireo_auth_service_deadline_test)
+        vireo_target_enable_sanitizers(vireo_auth_service_deadline_test)
+        add_test(NAME vireo_auth_service_deadline_test COMMAND vireo_auth_service_deadline_test)
+        set_tests_properties(vireo_auth_service_deadline_test PROPERTIES TIMEOUT 60)
         add_test(NAME vireo_auth_service_loop_real_test COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_auth_service_loop_real_test> schema)
         set_tests_properties(vireo_auth_service_loop_real_test PROPERTIES TIMEOUT 330)
