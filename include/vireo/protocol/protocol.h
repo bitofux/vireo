@@ -191,6 +191,8 @@ typedef uint16_t vireo_command_t;
 #define VIREO_COMMAND_NODE_MKDIR UINT16_C(0x0403)
 #define VIREO_COMMAND_NODE_REMOVE UINT16_C(0x0404)
 #define VIREO_COMMAND_NODE_MOVE UINT16_C(0x0405)
+/** @brief 已认证用户的根节点发现；请求空body，成功仅返回真实根ID。 */
+#define VIREO_COMMAND_NODE_ROOT UINT16_C(0x0406)
 
 /* 任务管理命令 */
 #define VIREO_COMMAND_TASK_LIST UINT16_C(0x0501)

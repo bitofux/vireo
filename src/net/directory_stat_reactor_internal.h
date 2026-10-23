@@ -4,14 +4,17 @@
 #define VIREO_NET_DIRECTORY_STAT_REACTOR_INTERNAL_H
 #include <vireo/net/directory_stat_reactor.h>
 #include <vireo/service/directory_stat_completion.h>
+#include <vireo/net/directory_root_reactor.h>
+#include <vireo/service/directory_root_completion.h>
 
 /** Reactor独占镜像；command非零占槽，提交前只占数值路由，committed才计count。 */
 typedef struct vireo_stat_expected {
-    vireo_command_t command; /**< 五命令之一；0为空槽。 */
+    vireo_command_t command; /**< 启用命令之一；0为空槽。 */
     bool committed; /**< 已交接或撤销残留，metadata完整。 */
     vireo_task_metadata_t metadata; /**< route/实例/op/期限独立原值。 */
+    vireo_node_root_request_t root_request; /**< 仅ROOT原请求值，无node ID。 */
     vireo_node_stat_request_t request; /**< 仅STAT原帧独立解码值。 */
-    vireo_mysql_node_actor_t actor; /**< 仅STAT原可信持久身份。 */
+    vireo_mysql_node_actor_t actor; /**< STAT/ROOT原可信持久身份。 */
 } vireo_stat_expected_t;
 /** 每客户唯一STAT首帧门禁，复用slot.task拥有未转移task，不复制owner。 */
 typedef struct vireo_stat_head {
@@ -24,7 +27,17 @@ typedef struct vireo_stat_head {
     unsigned rejection; /**< 0待enqueue/1待refresh/2已refresh。 */
     vireo_inflight_submit_report_t submit; /**< 一次登记/转移/撤销进度。 */
 } vireo_stat_head_t;
-/** 原客户槽，auth与STAT任一head非空即禁止新首帧；task只由一个分支拥有。 */
+typedef struct vireo_root_head {
+    unsigned state; /**< 0空/1待consume/2已consume，非公共ABI。 */
+    size_t frame_bytes; /**< 原精确首帧长，成功消费前读区保持。 */
+    uint32_t sequence; /**< 原共同framing非零序号。 */
+    vireo_status_t status; /**< 未移交时有效的本地空body拒绝状态。 */
+    bool transferred; /**< 原submit真实交接，非OK也不能重投。 */
+    vireo_result_t fatal; /**< 原基础设施主错，consume恢复不覆盖。 */
+    unsigned rejection; /**< 0待enqueue/1待refresh/2已refresh。 */
+    vireo_inflight_submit_report_t submit; /**< 一次登记/转移/撤销进度。 */
+} vireo_root_head_t;
+/** 原客户槽，任一head非空即禁止新首帧；task只由一个分支拥有。 */
 typedef struct client_slot {
     vireo_connection_pool_lease_t client;
     vireo_auth_request_head_receipt_t head;
@@ -32,9 +45,10 @@ typedef struct client_slot {
     vireo_task_t *task;
     bool audit_decided,closing;
     size_t cleanup_index;
+    vireo_root_head_t root_head; /**< ROOT独立首帧恢复状态。 */
     vireo_stat_head_t stat_head; /**< 仅新模式使用。 */
     bool records_cleaned; /**< 原inflight批清理完成，可进入镜像阶段。 */
-    size_t expected_cursor; /**< 镜像0..C+2有界清理恢复点。 */
+    size_t expected_cursor; /**< 镜像0..expected_capacity有界清理恢复点。 */
 } client_slot_t;
 /** take后保存独立值，0空/1待enqueue/2待refresh/3待destroy；不再take。 */
 typedef struct vireo_stat_receipt {
@@ -52,6 +66,20 @@ typedef struct vireo_stat_reactor_ops {
     vireo_result_t (*refresh)(void *,vireo_tcp_server_t *,vireo_connection_pool_lease_t); /**< 公开TLS flow刷新。 */
     vireo_result_t (*submit)(void *,vireo_inflight_store_t *,vireo_tcp_server_t const *,vireo_thread_pool_t *,size_t,vireo_task_t **,vireo_inflight_submit_report_t *); /**< 原transfer/rollback合同。 */
 } vireo_stat_reactor_ops_t;
+typedef struct vireo_root_receipt {
+    unsigned state;
+    vireo_directory_root_completion_outcome_t outcome;
+    vireo_inflight_completion_match_t match;
+} vireo_root_receipt_t;
+typedef struct vireo_root_reactor_ops {
+    void *context; /**< service访问期间借用；测试必须保活。 */
+    vireo_result_t (*utc)(void *,uint64_t *); /**< 可信UTC毫秒，成功才写输出。 */
+    vireo_result_t (*monotonic)(void *,uint64_t *); /**< 同域MONOTONIC，成功才写输出。 */
+    vireo_result_t (*consume)(void *,vireo_tcp_server_t *,vireo_connection_pool_lease_t,size_t); /**< 原帧消费一次。 */
+    vireo_result_t (*enqueue)(void *,vireo_tcp_server_t *,vireo_connection_pool_lease_t,unsigned char const *,size_t); /**< 公开整帧原子入队。 */
+    vireo_result_t (*refresh)(void *,vireo_tcp_server_t *,vireo_connection_pool_lease_t); /**< 公开TLS flow刷新。 */
+    vireo_result_t (*submit)(void *,vireo_inflight_store_t *,vireo_tcp_server_t const *,vireo_thread_pool_t *,size_t,vireo_task_t **,vireo_inflight_submit_report_t *); /**< 原transfer/rollback合同。 */
+} vireo_root_reactor_ops_t;
 struct vireo_auth_service {
     vireo_auth_service_resources_t r;
     vireo_auth_service_options_t o;
@@ -73,6 +101,13 @@ struct vireo_auth_service {
     bool stat_first; /**< 每轮切换队列先后次序。 */
     vireo_result_t infrastructure_result; /**< application返回客户错之外的服务级首错。 */
     vireo_stat_reactor_ops_t stat_ops;
+    vireo_completion_queue_t *root_queue; /**< 六模式长期借用。 */
+    uint32_t root_operation;
+    vireo_completion_t *root_completion; /**< pop后独占owner。 */
+    vireo_root_receipt_t root_receipt;
+    vireo_directory_root_reactor_report_t root_report;
+    vireo_root_reactor_ops_t root_ops;
+    unsigned completion_cursor; /**< 六模式轮首0..2。 */
 };
 /**
  * @brief 初始化本层默认公开操作表，不访问资源
@@ -85,7 +120,7 @@ void vireo_stat_reactor_default_ops(vireo_stat_reactor_ops_t *out);
  * @param[in,out] service 必需新模式存活owner，Reactor-only。
  * @param[in] client 当前完整客户，数值不保活。
  * @param[in] sequence 非零原序号。
- * @param[in] command 已分发的五命令之一。
+ * @param[in] command 已分发的启用命令之一。
  * @param[out] index 独立输出；SIZE_MAX表示store已满，不会有新登记。
  * @return OK；活动重复PROTOCOL；原观察错误透传，失败无reserve。
  * @note 只借用值，无资源转移/发号，外层保持errno。

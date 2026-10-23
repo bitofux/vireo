@@ -129,7 +129,8 @@ def real(server, helper, endpoint, user, password_file, database):
         assert 'AddressSanitizer' not in data and 'runtime error:' not in data
         v = {k: int(n) for k, n in re.findall(r'(\w+)=(-?\d+)', data)}
         assert v['clean'] == 1 and v['cleanup'] == 0 and v['created'] == v['joined'] == 2
-        assert v['queues_closed'] == 7 and v['queues_drained'] == 6 and v['final_drain_turns'] >= 1
+        expected_close, expected_drain = (7, 6) if 'fd_before' in v else (15, 14)
+        assert v['queues_closed'] == expected_close and v['queues_drained'] == expected_drain and v['final_drain_turns'] >= 1
         assert v['audit_created'] == v['audit_joined']
         if 'fd_before' in v:
             assert v['fd_before'] == v['fd_after']

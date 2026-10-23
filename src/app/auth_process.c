@@ -3,9 +3,9 @@
 #define _GNU_SOURCE
 #include "auth_process.h"
 #include "auth_worker_runtime.h"
-#include "directory_stat_worker_runtime.h"
+#include "directory_root_worker_runtime.h"
 #include <vireo/net/auth_service.h>
-#include <vireo/net/directory_stat_reactor.h>
+#include <vireo/net/directory_root_reactor.h>
 #include <vireo/persistence/mysql_schema.h>
 #include <vireo/base/secure_clear.h>
 #include <arpa/inet.h>
@@ -26,6 +26,7 @@
 #define REQUEST_TIMEOUT UINT64_C(10000000000)
 #define CLEANUP_ATTEMPTS ((size_t)8192)
 #define STAT_OPERATION UINT32_C(104)
+#define ROOT_OPERATION UINT32_C(105)
 /** 文件owner按实际分配尺寸擦除；尾后NUL不计入输入长度。 */
 typedef struct material { unsigned char *bytes; size_t size, capacity; } material_t;
 /** 仅主线程拥有；runtime发布后固定，faults为唯一并发字段。 */
@@ -46,7 +47,7 @@ typedef struct process {
     vireo_auth_sessions_t *sessions;
     vireo_task_queue_t *tasks;
     vireo_thread_pool_t *workers;
-    vireo_completion_queue_t *queue, *stat_queue;
+    vireo_completion_queue_t *queue, *stat_queue, *root_queue;
     vireo_notifier_t *notifier;
     vireo_auth_login_admission_t *admission;
     vireo_auth_service_t *service;
@@ -54,6 +55,8 @@ typedef struct process {
     bool runtime_initialized;
     vireo_directory_stat_worker_runtime_t mixed_runtime;
     bool mixed_runtime_initialized;
+    vireo_directory_root_worker_runtime_t root_runtime;
+    bool root_runtime_initialized;
 } process_t;
 /** 只有本进程应用层负责无法安全返回的残留owner。 */
 static void fatal(void) { _Exit(EXIT_FAILURE); }
@@ -108,16 +111,20 @@ static vireo_result_t stop_signal(process_t *p,vireo_auth_process_report_t *r)
     return VIREO_OK;
 }
 /**
- * @brief 按实际初始化阶段读取两个独立故障域，不访问未初始化原子
+ * @brief 按实际初始化阶段读取已初始化的独立故障域，不访问未初始化原子
  * @param[in] p 必需主线程存活装配对象；初始化标志仅本线程写，context寿命覆盖采样。
- * @return 两个独立永久位样本；尚未初始化的域为0，不是同时性或工作完成证明。
+ * @return 三个独立永久位样本（未启用ROOT为0）；尚未初始化的域为0，不是同时性或工作完成证明。
  * @note inspect意外失败无法可靠执行故障政策，沿应用fatal退出；正常路径保持errno。
  */
-static vireo_directory_stat_worker_faults_t faults(process_t const *p)
+static vireo_directory_root_worker_faults_t faults(process_t const *p)
 {
-    vireo_directory_stat_worker_faults_t bits={0};
-    if (p->mixed_runtime_initialized) {
-        if (vireo_directory_stat_worker_runtime_inspect_faults(&p->mixed_runtime,&bits)!=VIREO_OK) fatal();
+    vireo_directory_root_worker_faults_t bits={0};
+    if (p->root_runtime_initialized) {
+        if (vireo_directory_root_worker_runtime_inspect_faults(&p->root_runtime,&bits)!=VIREO_OK) fatal();
+    } else if (p->mixed_runtime_initialized) {
+        vireo_directory_stat_worker_faults_t before={0};
+        if (vireo_directory_stat_worker_runtime_inspect_faults(&p->mixed_runtime,&before)!=VIREO_OK) fatal();
+        bits.auth=before.auth; bits.stat=before.stat;
     } else if (p->runtime_initialized && vireo_auth_worker_runtime_inspect_faults(&p->runtime,&bits.auth)!=VIREO_OK) fatal();
     return bits;
 }
@@ -131,14 +138,14 @@ static vireo_result_t progress(process_t *p)
 /** 记录清理首错，owner残留由调用者独立检查。 */
 static void cleanup_result(vireo_auth_process_report_t *r,vireo_result_t rc)
 { if (r->cleanup_result==VIREO_OK && rc!=VIREO_OK) r->cleanup_result=rc; }
-/** 三提交端分别确认关闭后才join；不依据总rc或closed快照推导广播/线程回收事实。 */
+/** 所有启用提交端分别确认关闭后才join；不依据总rc或closed快照推导广播/线程回收事实。 */
 static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
 {
     if (p->audit && vireo_auth_failure_audit_close(p->audit,VIREO_AUTH_FAILURE_STOP)!=VIREO_OK) fatal();
     if (p->service) cleanup_result(r,vireo_auth_service_quiesce(p->service));
     if (p->server) cleanup_result(r,vireo_tcp_server_request_stop(p->server,NULL));
-    bool tasks_closed=p->tasks==NULL,queue_closed=p->queue==NULL,stat_closed=p->stat_queue==NULL;
-    for (size_t i=0;i<CLEANUP_ATTEMPTS && (!tasks_closed || !queue_closed || !stat_closed);++i) {
+    bool tasks_closed=p->tasks==NULL,queue_closed=p->queue==NULL,stat_closed=p->stat_queue==NULL,root_closed=p->root_queue==NULL;
+    for (size_t i=0;i<CLEANUP_ATTEMPTS && (!tasks_closed || !queue_closed || !stat_closed || !root_closed);++i) {
         if (!tasks_closed) {
             vireo_task_queue_close_report_t report;
             vireo_result_t rc=vireo_task_queue_close(p->tasks,VIREO_TASK_QUEUE_CANCEL_PENDING,&report);
@@ -160,9 +167,16 @@ static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
             stat_closed=rc==VIREO_OK;
             if (stat_closed) r->queues_closed|=4u;
         }
-        if (!tasks_closed || !queue_closed || !stat_closed) cleanup_result(r,progress(p));
+        if (!root_closed) {
+            vireo_completion_queue_close_report_t report;
+            vireo_result_t rc=vireo_completion_queue_close(p->root_queue,&report);
+            if (rc!=VIREO_OK && rc!=VIREO_RESULT_BUSY) fatal();
+            root_closed=rc==VIREO_OK;
+            if (root_closed) r->queues_closed|=8u;
+        }
+        if (!tasks_closed || !queue_closed || !stat_closed || !root_closed) cleanup_result(r,progress(p));
     }
-    if (!tasks_closed || !queue_closed || !stat_closed) fatal();
+    if (!tasks_closed || !queue_closed || !stat_closed || !root_closed) fatal();
     if (p->workers) {
         vireo_thread_pool_info_t info;
         if (vireo_thread_pool_inspect(p->workers,&info)!=VIREO_OK) fatal();
@@ -195,11 +209,11 @@ static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
     if (vireo_auth_failure_writer_join(&p->audit_writer)!=VIREO_OK) fatal();
     r->audit_writer=p->audit_writer.report;
     if (p->audit && vireo_auth_failure_audit_inspect(p->audit,&r->audit_queue)!=VIREO_OK) fatal();
-    vireo_directory_stat_worker_faults_t const final=faults(p);
-    r->final_faults=final.auth; r->stat_final_faults=final.stat;
+    vireo_directory_root_worker_faults_t const final=faults(p);
+    r->final_faults=final.auth; r->stat_final_faults=final.stat; r->root_final_faults=final.root;
 }
 /**
- * @brief 全部producer退出后分别观察两完成队列，保存实际空事实
+ * @brief 全部producer退出后分别观察已启用完成队列，保存实际空事实
  * @param[in] p 必需主线程独占对象；已完成shutdown_workers，queue借用至返回。
  * @param[in,out] r 必需独占报告，空queue对应位只OR；未创建的queue不置位。
  * @retval true 所有已创建完成queue均为空；service内部owner/receipt仍须独立结束。
@@ -210,14 +224,14 @@ static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
 static bool completions_empty(process_t const *p,vireo_auth_process_report_t *r)
 {
     bool empty=true;
-    vireo_completion_queue_t *const queues[]={p->queue,p->stat_queue};
-    for (size_t i=0;i<2;++i) {
+    vireo_completion_queue_t *const queues[]={p->queue,p->stat_queue,p->root_queue};
+    for (size_t i=0;i<3;++i) {
         if (!queues[i]) continue;
         vireo_completion_queue_info_t info;
         vireo_result_t const rc=vireo_completion_queue_inspect(queues[i],&info);
         if (rc!=VIREO_OK) fatal();
         if (info.count) empty=false;
-        else r->queues_drained|=i==0?2u:4u;
+        else r->queues_drained|=2u<<(unsigned)i;
     }
     return empty;
 }
@@ -240,6 +254,7 @@ static void cleanup(process_t *p,vireo_auth_process_report_t *r)
 } while (0)
     RELEASE(workers,vireo_thread_pool_destroy(&p->workers));
     RELEASE(notifier,vireo_notifier_destroy(&p->notifier,NULL));
+    RELEASE(root_queue,vireo_completion_queue_destroy(&p->root_queue));
     RELEASE(stat_queue,vireo_completion_queue_destroy(&p->stat_queue));
     RELEASE(queue,vireo_completion_queue_destroy(&p->queue));
     RELEASE(tasks,vireo_task_queue_destroy(&p->tasks));
@@ -337,6 +352,9 @@ static vireo_result_t run(process_t *p,vireo_auth_process_options_t const *o,vir
     vireo_task_queue_options_t const tasks={64,MEMORY}; TRY(vireo_task_queue_create(&tasks,&p->tasks)); TRY(vireo_task_queue_prepare_wait(p->tasks));
     vireo_completion_queue_options_t const queue={64,MEMORY}; TRY(vireo_completion_queue_create(&queue,&p->queue)); TRY(vireo_completion_queue_prepare_wait(p->queue));
     TRY(vireo_completion_queue_create(&queue,&p->stat_queue)); TRY(vireo_completion_queue_prepare_wait(p->stat_queue));
+    if(o->root_completion_allocation_budget) {
+        TRY(vireo_completion_queue_create(&queue,&p->root_queue)); TRY(vireo_completion_queue_prepare_wait(p->root_queue));
+    }
     vireo_notifier_options_t const notifier={4096}; TRY(vireo_notifier_create(&notifier,&p->notifier,NULL));
     uint64_t now=0; TRY(vireo_clock_monotonic_now(&now,NULL));
     vireo_auth_login_admission_options_t const admission=VIREO_AUTH_LOGIN_ADMISSION_OPTIONS_DEFAULT;
@@ -352,9 +370,18 @@ static vireo_result_t run(process_t *p,vireo_auth_process_options_t const *o,vir
         .max_memory_bytes=65536};
     TRY(vireo_directory_stat_worker_runtime_init(&p->mixed_runtime,&p->runtime,&stat_resources,&stat_worker,3));
     p->mixed_runtime_initialized=true;
+    if(p->root_queue) {
+        vireo_directory_root_worker_resources_t const rr={p->mysql,p->database,p->root_queue,p->notifier};
+        vireo_directory_root_worker_options_t const ro={.execution={ROOT_OPERATION,5000},
+            .completion_allocation_budget=o->root_completion_allocation_budget,.max_memory_bytes=65536};
+        TRY(vireo_directory_root_worker_runtime_init(&p->root_runtime,&p->mixed_runtime,&rr,&ro,3));
+        p->root_runtime_initialized=true;
+    }
     r->phase=VIREO_AUTH_PROCESS_WORKERS;
     vireo_thread_pool_options_t const workers={2,MEMORY}; TRY(vireo_thread_pool_create(&workers,&p->workers));
-    vireo_thread_pool_configuration_t const config={p->tasks,vireo_directory_stat_worker_runtime_execute,&p->mixed_runtime};
+    vireo_thread_pool_configuration_t const config={p->tasks,
+        p->root_queue?vireo_directory_root_worker_runtime_execute:vireo_directory_stat_worker_runtime_execute,
+        p->root_queue?(void *)&p->root_runtime:(void *)&p->mixed_runtime};
     TRY(vireo_thread_pool_configure(p->workers,&config,NULL)); vireo_thread_pool_report_t started;
     TRY(vireo_thread_pool_start(p->workers,&started)); TRY(vireo_thread_pool_enable_execution(p->workers,&started));
     r->phase=VIREO_AUTH_PROCESS_LISTENER;
@@ -370,18 +397,19 @@ static vireo_result_t run(process_t *p,vireo_auth_process_options_t const *o,vir
     vireo_auth_service_options_t const options={.max_clients=8,.admit={8,16},.max_completions=16,.cleanup_slots=32,
         .receive={4096,8},.send={4096,8},.task_allocation_budget=4096,.max_client_requests=8,
         .register_operation=100,.login_operation=101,.logout_operation=102,.resume_operation=103,.request_timeout_ns=REQUEST_TIMEOUT,.max_memory_bytes=MEMORY};
-    TRY(vireo_directory_stat_reactor_create(&service,&options,p->stat_queue,STAT_OPERATION,&p->service));
+    if(p->root_queue) { TRY(vireo_directory_root_reactor_create(&service,&options,p->stat_queue,STAT_OPERATION,p->root_queue,ROOT_OPERATION,&p->service)); }
+    else { TRY(vireo_directory_stat_reactor_create(&service,&options,p->stat_queue,STAT_OPERATION,&p->service)); }
     TRY(stop_signal(p,r));
     if (r->stop_signal) goto done;
     if (fputs("vireo-auth-server ready\n",stdout)==EOF || fflush(stdout)!=0) { rc=VIREO_RESULT_INTERNAL; goto done; }
     r->ready=true; r->phase=VIREO_AUTH_PROCESS_RUNNING;
     for (;;) {
-        vireo_directory_stat_worker_faults_t sampled=faults(p);
-        if (sampled.auth || sampled.stat) { rc=VIREO_RESULT_INTERNAL; break; }
+        vireo_directory_root_worker_faults_t sampled=faults(p);
+        if (sampled.auth || sampled.stat || sampled.root) { rc=VIREO_RESULT_INTERNAL; break; }
         TRY(stop_signal(p,r)); if (r->stop_signal) break;
         vireo_auth_service_report_t turn; TRY(vireo_auth_service_once(p->service,100,&turn));
         sampled=faults(p);
-        if (sampled.auth || sampled.stat) { rc=VIREO_RESULT_INTERNAL; break; }
+        if (sampled.auth || sampled.stat || sampled.root) { rc=VIREO_RESULT_INTERNAL; break; }
         if(o->audit_observer && p->audit) {
             vireo_auth_failure_audit_info_t info;
             if(vireo_auth_failure_audit_inspect(p->audit,&info)==VIREO_OK)
@@ -390,14 +418,15 @@ static vireo_result_t run(process_t *p,vireo_auth_process_options_t const *o,vir
     }
 done:
     ; /* C11标签必须跟语句；空语句之后才声明收尾快照。 */
-    vireo_directory_stat_worker_faults_t const stopped=faults(p);
-    r->faults_at_stop=stopped.auth; r->stat_faults_at_stop=stopped.stat;
+    vireo_directory_root_worker_faults_t const stopped=faults(p);
+    r->faults_at_stop=stopped.auth; r->stat_faults_at_stop=stopped.stat; r->root_faults_at_stop=stopped.root;
     cleanup(p,r);
     if (rc==VIREO_OK && (r->cleanup_result!=VIREO_OK || r->faults_at_stop ||
-        r->stat_faults_at_stop ||
+        r->stat_faults_at_stop || r->root_faults_at_stop ||
         (r->final_faults & ~(unsigned)VIREO_AUTH_WORKER_FAULT_PUBLISH) ||
         (r->stat_final_faults & ~(unsigned)VIREO_DIRECTORY_STAT_WORKER_FAULT_PUBLISH) ||
-        (!r->stop_signal && (r->final_faults || r->stat_final_faults)))) rc=VIREO_RESULT_INTERNAL;
+        (r->root_final_faults & ~(unsigned)VIREO_DIRECTORY_ROOT_WORKER_FAULT_PUBLISH) ||
+        (!r->stop_signal && (r->final_faults || r->stat_final_faults || r->root_final_faults)))) rc=VIREO_RESULT_INTERNAL;
 #undef TRY
     return rc;
 }
@@ -411,7 +440,7 @@ vireo_result_t vireo_auth_process_run(vireo_auth_process_options_t const *o,vire
         !o->certificate_file || !o->key_file || !o->mysql_socket || !o->mysql_user || !o->password_file || !o->database ||
         !*o->certificate_file || !*o->key_file || !*o->mysql_socket || !*o->mysql_user || !*o->password_file || !*o->database ||
         !o->session_lifetime_ms || !o->completion_allocation_budget || o->completion_allocation_budget>MEMORY ||
-        !o->stat_completion_allocation_budget || o->stat_completion_allocation_budget>MEMORY) {
+        !o->stat_completion_allocation_budget || o->stat_completion_allocation_budget>MEMORY || o->root_completion_allocation_budget>MEMORY) {
         errno=saved; return VIREO_RESULT_INVALID_ARGUMENT;
     }
     int previous=0;

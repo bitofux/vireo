@@ -63,6 +63,7 @@ bool vireo_command_is_known(vireo_command_t command) {
         case VIREO_COMMAND_NODE_MKDIR:
         case VIREO_COMMAND_NODE_REMOVE:
         case VIREO_COMMAND_NODE_MOVE:
+        case VIREO_COMMAND_NODE_ROOT:
 
         case VIREO_COMMAND_TASK_LIST:
         case VIREO_COMMAND_TASK_STATUS:
@@ -154,6 +155,9 @@ char const *vireo_command_name(vireo_command_t command) {
 
         case VIREO_COMMAND_NODE_MOVE:
             return "node_move";
+
+        case VIREO_COMMAND_NODE_ROOT:
+            return "node_root";
 
         case VIREO_COMMAND_TASK_LIST:
             return "task_list";

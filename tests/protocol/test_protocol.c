@@ -209,6 +209,7 @@ s_assert(VIREO_COMMAND_NODE_MKDIR == UINT16_C(0x0403), "unexpected NODE_MKDIR");
 s_assert(VIREO_COMMAND_NODE_REMOVE == UINT16_C(0x0404), "unexpected NODE_REMOVE");
 
 s_assert(VIREO_COMMAND_NODE_MOVE == UINT16_C(0x0405), "unexpected NODE_MOVE");
+s_assert(VIREO_COMMAND_NODE_ROOT == UINT16_C(0x0406), "unexpected NODE_ROOT");
 
 s_assert(VIREO_COMMAND_TASK_LIST == UINT16_C(0x0501), "unexpected TASK_LIST");
 
@@ -371,6 +372,7 @@ static struct command_case const known_command_cases[] = {
     {VIREO_COMMAND_NODE_MKDIR, "node_mkdir"},
     {VIREO_COMMAND_NODE_REMOVE, "node_remove"},
     {VIREO_COMMAND_NODE_MOVE, "node_move"},
+    {VIREO_COMMAND_NODE_ROOT, "node_root"},
     {VIREO_COMMAND_TASK_LIST, "task_list"},
     {VIREO_COMMAND_TASK_STATUS, "task_status"},
     {VIREO_COMMAND_TASK_CANCEL, "task_cancel"},

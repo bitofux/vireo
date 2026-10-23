@@ -19,7 +19,7 @@ typedef struct vireo_directory_stat_reactor_report {
     size_t deadline_downgraded; /**< 本轮最终以TIMEOUT首次入FIFO数，非历史重复尝试数。 */
     bool response_blocked; /**< 本轮STAT本地拒绝/结果曾因FIFO空间不足保留进度。 */
     bool completion_pending; /**< 返回时仍持STAT completion owner；与队列深度无关。 */
-    size_t expected_requests; /**< 返回时五命令镜像表已提交项数，含已take但尚未结束交付项。 */
+    size_t expected_requests; /**< 返回时全部启用命令镜像表已提交项数（五或六），含已take但尚未结束交付项。 */
 } vireo_directory_stat_reactor_report_t;
 
 /**
