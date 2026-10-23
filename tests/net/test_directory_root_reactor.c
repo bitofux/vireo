@@ -12,7 +12,7 @@ typedef struct model {
     vireo_task_t *captured;
     vireo_root_reactor_ops_t native;
     unsigned enqueue_calls,refresh_calls,consume_calls,submit_calls;
-    bool blocked,refresh_error,consume_error,submit_error,rollback_error,error_result;
+    bool blocked,refresh_error,consume_error,submit_error,rollback_error,error_result,allocation_error;
     uint64_t utc,now;
 } model_t;
 static vireo_result_t execute(void *c,vireo_task_t const *task)
@@ -68,6 +68,14 @@ static vireo_result_t submit(void *c,vireo_inflight_store_t *s,vireo_tcp_server_
     vireo_result_t rc=m->native.submit(NULL,s,server,pool,max,task,p);
     return m->submit_error && p->pool_report.queue_report.transferred?VIREO_RESULT_IO:rc;
 }
+static vireo_result_t create_task(void *c,vireo_task_metadata_t meta,uint32_t operation,
+    unsigned char const *wire,size_t n,vireo_mysql_node_actor_t const *actor,size_t budget,vireo_task_t **owner)
+{
+    model_t *m=c;
+    REQUIRE(owner && !*owner && budget==4096);
+    if(m->allocation_error) return VIREO_RESULT_NO_MEMORY;
+    return m->native.create_task(NULL,meta,operation,wire,n,actor,budget,owner);
+}
 /** fixture的成功认证也须读取实际帧长，并重试未移交任务的短暂OVERLOADED。 */
 static vireo_auth_response_t auth_request(model_t *m,bool login,uint32_t sequence)
 {
@@ -103,7 +111,7 @@ static void setup_model(model_t *m,bool login)
     EXPECT(vireo_completion_queue_create(&qo,&m->stat),VIREO_OK); EXPECT(vireo_completion_queue_prepare_wait(m->stat),VIREO_OK);
     EXPECT(vireo_directory_root_reactor_create(&r,&o,m->stat,401,m->root,400,&m->t.service),VIREO_OK);
     m->native=m->t.service->root_ops;
-    m->t.service->root_ops=(vireo_root_reactor_ops_t){m,clock_utc,clock_now,consume,enqueue,refresh,submit};
+    m->t.service->root_ops=(vireo_root_reactor_ops_t){m,clock_utc,clock_now,consume,enqueue,refresh,submit,create_task};
     peer_connect(&m->t); m->t.client=m->t.service->slots[0].client;
     if(login) {
         vireo_auth_response_t response=auth_request(m,true,1); REQUIRE(response.status==VIREO_STATUS_OK);
@@ -151,7 +159,10 @@ static void finish_model(model_t *m)
     vireo_thread_pool_report_t joined; vireo_result_t join_result=VIREO_RESULT_BUSY;
     for(size_t i=0;i<100000 && join_result==VIREO_RESULT_BUSY;++i) {
         join_result=vireo_thread_pool_stop_and_join(t->workers,&joined);
-        if(join_result==VIREO_RESULT_BUSY) REQUIRE(sched_yield()==0);
+        if(join_result==VIREO_RESULT_BUSY) {
+            REQUIRE(joined.stage==VIREO_THREAD_POOL_STAGE_CHECK_QUEUE);
+            REQUIRE(sched_yield()==0);
+        }
     }
     REQUIRE((join_result==VIREO_OK || join_result==VIREO_RESULT_CANCELLED) && joined.joined_count==1);
     for(;;) {
@@ -228,9 +239,9 @@ static void admission(void)
     wire[28]=(unsigned char)(crc>>24); wire[29]=(unsigned char)(crc>>16); wire[30]=(unsigned char)(crc>>8); wire[31]=(unsigned char)crc;
     peer_write(&m.t,wire,n); r=response(&m,32); REQUIRE(r.status==VIREO_STATUS_BAD_REQUEST && m.submit_calls==1);
     request(&m,13,h+1); r=response(&m,32); REQUIRE(r.status==VIREO_STATUS_UNAUTHORIZED && m.submit_calls==1);
-    m.t.service->o.task_allocation_budget=1;
+    m.allocation_error=true; /* 预算不足是RANGE；显式注入真实分配失败类别。 */
     request(&m,14,h); r=response(&m,32); REQUIRE(r.status==VIREO_STATUS_OVERLOADED && m.submit_calls==1);
-    m.t.service->o.task_allocation_budget=4096;
+    m.allocation_error=false;
     finish_model(&m);
 }
 static void identity_and_deadline(void)

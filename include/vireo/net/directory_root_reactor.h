@@ -1,5 +1,5 @@
 /* PROJECT: VIREO; FILE: directory_root_reactor.h; AUTHOR: bitofux;
- * DATE: 2026-10-22; BRIEF: 候选：认证四命令、STAT与ROOT的单Reactor。 */
+ * DATE: 2026-10-22; BRIEF: 认证四命令、STAT与ROOT的单Reactor。 */
 #ifndef VIREO_NET_DIRECTORY_ROOT_REACTOR_H
 #define VIREO_NET_DIRECTORY_ROOT_REACTOR_H
 #include <vireo/net/directory_stat_reactor.h>

@@ -2,6 +2,7 @@
  * 只组合公开owner合同，不读取其他模块私有状态。 */
 #define _GNU_SOURCE
 #include "auth_process.h"
+#include "auth_process_internal.h"
 #include "auth_worker_runtime.h"
 #include "directory_root_worker_runtime.h"
 #include <vireo/net/auth_service.h>
@@ -138,6 +139,19 @@ static vireo_result_t progress(process_t *p)
 /** 记录清理首错，owner残留由调用者独立检查。 */
 static void cleanup_result(vireo_auth_process_report_t *r,vireo_result_t rc)
 { if (r->cleanup_result==VIREO_OK && rc!=VIREO_OK) r->cleanup_result=rc; }
+vireo_result_t vireo_auth_process_join_with(vireo_thread_pool_t *pool,size_t attempts,
+    vireo_result_t (*join)(vireo_thread_pool_t *,vireo_thread_pool_report_t *),vireo_thread_pool_report_t *out)
+{
+    int const saved=errno; vireo_result_t rc=VIREO_RESULT_INVALID_ARGUMENT;
+    if(pool && attempts && join && out) {
+        for(size_t i=0;i<attempts;++i) {
+            vireo_thread_pool_report_t report={0}; rc=join(pool,&report); *out=report;
+            if(rc!=VIREO_RESULT_BUSY || report.stage!=VIREO_THREAD_POOL_STAGE_CHECK_QUEUE) break;
+            (void)sched_yield();
+        }
+    }
+    errno=saved; return rc;
+}
 /** 所有启用提交端分别确认关闭后才join；不依据总rc或closed快照推导广播/线程回收事实。 */
 static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
 {
@@ -182,7 +196,7 @@ static void shutdown_workers(process_t *p,vireo_auth_process_report_t *r)
         if (vireo_thread_pool_inspect(p->workers,&info)!=VIREO_OK) fatal();
         if (info.created_count!=info.joined_count) {
             vireo_thread_pool_report_t joined;
-            vireo_result_t const rc=vireo_thread_pool_stop_and_join(p->workers,&joined);
+            vireo_result_t const rc=vireo_auth_process_join_with(p->workers,CLEANUP_ATTEMPTS,vireo_thread_pool_stop_and_join,&joined);
             if (joined.stage!=VIREO_THREAD_POOL_STAGE_NONE && joined.stage!=VIREO_THREAD_POOL_STAGE_EXECUTE_TASK)
                 cleanup_result(r,rc);
             if (vireo_thread_pool_inspect(p->workers,&info)!=VIREO_OK) fatal();

@@ -11,6 +11,7 @@
 #include <vireo/service/auth_login_admission.h>
 #include <vireo/thread/thread_pool.h>
 #include <vireo/base/secure_clear.h>
+#include <vireo/base/clock.h>
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -226,7 +227,20 @@ int main(int argc,char **argv)
         assert(task==NULL);
     }
     vireo_thread_pool_shutdown_report_t shutdown;
-    assert(vireo_thread_pool_shutdown_and_join(workers,VIREO_TASK_QUEUE_DRAIN,&shutdown)==VIREO_OK);
+    uint64_t join_begin=0,join_now=0;
+    CHECK(vireo_clock_monotonic_now(&join_begin,NULL),VIREO_OK);
+    for(;;) {
+        vireo_result_t const join_rc=vireo_thread_pool_shutdown_and_join(workers,VIREO_TASK_QUEUE_DRAIN,&shutdown);
+        if(join_rc==VIREO_OK) break;
+        /* 只恢复公开关闭锁竞争/回收前资格观察，绝不重试业务或pthread join失败。 */
+        assert(join_rc==VIREO_RESULT_BUSY &&
+            ((shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_CLOSE_QUEUE && !shutdown.join_called) ||
+             (shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_JOIN_WORKERS &&
+              shutdown.pool_report.stage==VIREO_THREAD_POOL_STAGE_CHECK_QUEUE)));
+        assert(sched_yield()==0);
+        CHECK(vireo_clock_monotonic_now(&join_now,NULL),VIREO_OK);
+        assert(join_now-join_begin<UINT64_C(5000000000));
+    }
     assert(shutdown.pool_report.joined_count==2 && f.completed[0]==1 && f.completed[1]==1);
     vireo_rate_limit_decision_t decision;
     CHECK(vireo_auth_login_admission_check(admission,0,&peer,"ALICE_7",7,device,&decision),VIREO_OK);

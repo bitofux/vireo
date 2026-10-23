@@ -38,8 +38,11 @@ static vireo_result_t refresh(void *c,vireo_tcp_server_t *s,vireo_connection_poo
 static vireo_result_t submit(void *c,vireo_inflight_store_t *s,vireo_tcp_server_t const *server,
     vireo_thread_pool_t *pool,size_t max,vireo_task_t **task,vireo_inflight_submit_report_t *p)
 { (void)c; return vireo_inflight_store_try_submit(s,server,pool,max,task,p); }
+static vireo_result_t create_task(void *c,vireo_task_metadata_t m,uint32_t operation,
+    unsigned char const *wire,size_t n,vireo_mysql_node_actor_t const *actor,size_t budget,vireo_task_t **owner)
+{ (void)c; return vireo_directory_root_task_create(m,operation,wire,n,actor,budget,NULL,owner); }
 void vireo_root_reactor_default_ops(vireo_root_reactor_ops_t *out)
-{ *out=(vireo_root_reactor_ops_t){NULL,utc,monotonic,consume,enqueue,refresh,submit}; }
+{ *out=(vireo_root_reactor_ops_t){NULL,utc,monotonic,consume,enqueue,refresh,submit,create_task}; }
 
 static vireo_stat_expected_t *expected(vireo_auth_service_t const *s,vireo_task_metadata_t m)
 {
@@ -132,8 +135,8 @@ vireo_result_t vireo_root_reactor_head(vireo_auth_service_t *s,client_slot_t *sl
         s->root_operation,deadline,&metadata,NULL);
     if(rc!=VIREO_OK) { h->fatal=rc; goto finish; }
     vireo_mysql_node_actor_t const actor={identity.user_id,identity.session_id};
-    rc=vireo_directory_root_task_create(metadata,s->root_operation,wire,view.wire_size,&actor,
-        s->o.task_allocation_budget,NULL,&slot->task);
+    rc=s->root_ops.create_task(s->root_ops.context,metadata,s->root_operation,wire,view.wire_size,&actor,
+        s->o.task_allocation_budget,&slot->task);
     if(rc==VIREO_RESULT_NO_MEMORY) { h->status=VIREO_STATUS_OVERLOADED; goto finish; }
     if(rc!=VIREO_OK) { h->fatal=rc; goto finish; }
     s->expected[index]=(vireo_stat_expected_t){.command=VIREO_COMMAND_NODE_ROOT,.metadata=metadata,.root_request=request,.actor=actor};

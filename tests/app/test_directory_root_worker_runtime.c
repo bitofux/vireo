@@ -6,6 +6,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include "directory_root_worker_runtime_internal.h"
+#include "auth_process_internal.h"
 #include "directory_root_test_support.h"
 #include <pthread.h>
 #include <sys/wait.h>
@@ -276,11 +277,33 @@ static void close_four_queues(void)
     CHECK(vireo_thread_pool_destroy(&workers),VIREO_OK);CHECK(vireo_task_queue_destroy(&tasks),VIREO_OK);
     CHECK(vireo_notifier_destroy(&f.notifier,NULL),VIREO_OK);
 }
+static unsigned join_calls,join_busy_count;
+static vireo_thread_pool_stage_t join_stage;
+static vireo_result_t joining(vireo_thread_pool_t *pool,vireo_thread_pool_report_t *out)
+{
+    assert(pool); ++join_calls;
+    *out=(vireo_thread_pool_report_t){.stage=join_calls<=join_busy_count?join_stage:VIREO_THREAD_POOL_STAGE_NONE};
+    return join_calls<=join_busy_count?VIREO_RESULT_BUSY:VIREO_OK;
+}
+static void join_contention(void)
+{
+    max_align_t marker; vireo_thread_pool_t *pool=(vireo_thread_pool_t *)&marker;
+    vireo_thread_pool_report_t report={0};
+    join_stage=VIREO_THREAD_POOL_STAGE_CHECK_QUEUE; join_busy_count=2;join_calls=0;
+    CHECK(vireo_auth_process_join_with(pool,3,joining,&report),VIREO_OK);assert(join_calls==3);
+    join_busy_count=3;join_calls=0;
+    CHECK(vireo_auth_process_join_with(pool,3,joining,&report),VIREO_RESULT_BUSY);assert(join_calls==3 && report.stage==join_stage);
+    join_stage=VIREO_THREAD_POOL_STAGE_EXECUTE_TASK;join_calls=0;
+    CHECK(vireo_auth_process_join_with(pool,3,joining,&report),VIREO_RESULT_BUSY);assert(join_calls==1);
+    join_stage=VIREO_THREAD_POOL_STAGE_JOIN_WORKER;join_calls=0;
+    CHECK(vireo_auth_process_join_with(pool,3,joining,&report),VIREO_RESULT_BUSY);assert(join_calls==1);
+    CHECK(vireo_auth_process_join_with(pool,0,joining,&report),VIREO_RESULT_INVALID_ARGUMENT);assert(join_calls==1);
+}
 int main(int argc,char **argv)
 {
     if(argc==4 && !strcmp(argv[1],"--fatal")) { fatal_child(atoi(argv[2]),(unsigned)atoi(argv[3]));return 99; }
     assert(argc==1);int old=0;assert(pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,&old)==0);
     vireo_task_t *t=task();invalid(t);cases(t);concurrent(t);CHECK(vireo_task_destroy(&t),VIREO_OK);
-    fatal_cases();close_four_queues();assert(pthread_setcancelstate(old,NULL)==0);
+    fatal_cases();close_four_queues();join_contention();assert(pthread_setcancelstate(old,NULL)==0);
     puts("PASS directory_root_worker_runtime: op routing, fourteen fault/transfer/owner models, budgets1..16, four simultaneous workers OR all bits, exec worker _Exit budgets1/3/16, both real producers full before three-close/join and final drains");return 0;
 }

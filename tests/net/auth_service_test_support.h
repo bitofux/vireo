@@ -135,7 +135,20 @@ static inline void service_cleanup(service_fixture_t *t)
 {
     EXPECT(vireo_auth_service_quiesce(t->service),VIREO_OK);
     vireo_thread_pool_shutdown_report_t shut;
-    EXPECT(vireo_thread_pool_shutdown_and_join(t->workers,VIREO_TASK_QUEUE_DRAIN,&shut),VIREO_OK);
+    uint64_t begin=0,now=0;
+    EXPECT(vireo_clock_monotonic_now(&begin,NULL),VIREO_OK);
+    for(;;) {
+        vireo_result_t const rc=vireo_thread_pool_shutdown_and_join(t->workers,VIREO_TASK_QUEUE_DRAIN,&shut);
+        if(rc==VIREO_OK) break;
+        /* 只恢复尚未join的关闭/资格观察竞争；不重试业务或pthread错误。 */
+        REQUIRE(rc==VIREO_RESULT_BUSY &&
+            ((shut.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_CLOSE_QUEUE && !shut.join_called) ||
+             (shut.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_JOIN_WORKERS &&
+              shut.pool_report.stage==VIREO_THREAD_POOL_STAGE_CHECK_QUEUE)));
+        REQUIRE(sched_yield()==0);
+        EXPECT(vireo_clock_monotonic_now(&now,NULL),VIREO_OK);
+        REQUIRE(now-begin<UINT64_C(5000000000));
+    }
     if(t->f.peer>=0) service_disconnect(t);
     for(size_t i=0;i<4;++i) (void)service_turn(t);
     EXPECT(vireo_auth_service_destroy(&t->service),VIREO_OK);
