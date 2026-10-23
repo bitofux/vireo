@@ -157,7 +157,27 @@ int main(int argc,char **argv)
     REQUIRE(seen==3 && t.submitted==4 && t.completed==4 && !t.rejected);
     EXPECT(vireo_auth_service_quiesce(t.service),VIREO_OK);
     vireo_thread_pool_shutdown_report_t shutdown;
-    EXPECT(vireo_thread_pool_shutdown_and_join(t.workers,VIREO_TASK_QUEUE_DRAIN,&shutdown),VIREO_OK);
+    uint64_t shutdown_start=0, shutdown_now=0;
+    EXPECT(vireo_clock_monotonic_now(&shutdown_start,NULL),VIREO_OK);
+    for (;;) {
+        vireo_result_t const rc=vireo_thread_pool_shutdown_and_join(t.workers,VIREO_TASK_QUEUE_DRAIN,&shutdown);
+        if (rc==VIREO_OK) break;
+        /* 只重试公开队列的无进度锁竞争，不吞掉worker或join错误。 */
+        REQUIRE(rc==VIREO_RESULT_BUSY);
+        if (shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_CLOSE_QUEUE) {
+            REQUIRE(shutdown.close_called && !shutdown.join_called && !shutdown.close_report.changed &&
+                shutdown.close_report.stage==VIREO_TASK_QUEUE_STAGE_LOCK &&
+                shutdown.close_report.pthread_error==EBUSY);
+        } else {
+            REQUIRE(shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_JOIN_WORKERS &&
+                shutdown.close_called && shutdown.join_called &&
+                shutdown.pool_report.stage==VIREO_THREAD_POOL_STAGE_CHECK_QUEUE &&
+                !shutdown.pool_report.pthread_error && !shutdown.pool_report.joined_count);
+        }
+        EXPECT(vireo_clock_monotonic_now(&shutdown_now,NULL),VIREO_OK);
+        REQUIRE(shutdown_now-shutdown_start<UINT64_C(5000000000));
+        sched_yield();
+    }
     REQUIRE(shutdown.pool_report.joined_count==2 && atomic_load(&w.calls)==4);
     vireo_mysql_user_repository_t *repo=NULL; vireo_password_policy_t const policy=VIREO_PASSWORD_POLICY_DEFAULT;
     EXPECT(vireo_mysql_user_repository_create(thread,database,&policy,&repo,NULL),VIREO_OK);
