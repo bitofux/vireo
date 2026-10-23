@@ -101,7 +101,19 @@ static void stop_discard(service_fixture_t *t,vireo_result_t worker_result)
         if(!task_closed || !completion_closed)(void)service_turn(t);
     }
     REQUIRE(task_closed && completion_closed);
-    vireo_thread_pool_report_t joined;EXPECT(vireo_thread_pool_stop_and_join(t->workers,&joined),worker_result);
+    /* close成功后的公开队列观察仍可竞争；只恢复尚未停止/join的CHECK_QUEUE BUSY。
+     * EXECUTE_TASK的业务首错、pthread错误或任何已有join进度均不重试。 */
+    vireo_thread_pool_report_t joined;
+    vireo_result_t join_result; uint64_t begin=0,now=0;
+    EXPECT(vireo_clock_monotonic_now(&begin,NULL),VIREO_OK);
+    for(;;) {
+        errno=EDOM; join_result=vireo_thread_pool_stop_and_join(t->workers,&joined); REQUIRE(errno==EDOM);
+        if(join_result!=VIREO_RESULT_BUSY || joined.stage!=VIREO_THREAD_POOL_STAGE_CHECK_QUEUE) break;
+        REQUIRE(!joined.pthread_error && !joined.stop_requested && joined.created_count==1 && !joined.joined_count);
+        EXPECT(vireo_clock_monotonic_now(&now,NULL),VIREO_OK); REQUIRE(now-begin<UINT64_C(5000000000));
+        REQUIRE(sched_yield()==0);
+    }
+    REQUIRE(join_result==worker_result);
     REQUIRE(joined.joined_count==1 && joined.created_count==1);
     vireo_thread_pool_worker_result_t result;EXPECT(vireo_thread_pool_inspect_worker_result(t->workers,0,&result),VIREO_OK);
     REQUIRE(result.result==worker_result);

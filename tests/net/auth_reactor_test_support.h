@@ -78,13 +78,13 @@ static inline void client_open(fixture_t *f,bool establish) {
     }
     REQUIRE(client_done && server_done && SSL_version(f->ssl)==TLS1_3_VERSION && SSL_get_verify_result(f->ssl)==X509_V_OK);
 }
-static inline void setup_capacity(fixture_t *f,bool establish,size_t capacity) {
+static inline void setup_capacity_profile(fixture_t *f,bool establish,size_t capacity,size_t write_capacity) {
     *f=(fixture_t){.peer=-1};
     vireo_tls_context_options_t const co={fixture_leaf,sizeof fixture_leaf-1,fixture_key,sizeof fixture_key-1,4096};
     vireo_tls_context_t *context=NULL;
     EXPECT(vireo_tls_context_create_server(&co,&context,NULL),VIREO_OK);
-    vireo_tcp_server_options_t const so={capacity,4,1048576,32768};
-    vireo_tcp_server_tls_options_t const to={{4096,4096,40960,256,255,4096,0,4096},
+    vireo_tcp_server_options_t const so={capacity,4,1048576,write_capacity>4096?4096+write_capacity:32768};
+    vireo_tcp_server_tls_options_t const to={{4096,write_capacity,4096+write_capacity+32768,256,255,4096,0,write_capacity},
         4096,UINT64_C(5000000000),163840};
     EXPECT(vireo_tcp_server_create_tls_with_auxiliary_capacity(&so,&to,1,&context,&f->server,NULL),VIREO_OK);
     REQUIRE(context==NULL);
@@ -103,6 +103,8 @@ static inline void setup_capacity(fixture_t *f,bool establish,size_t capacity) {
     EXPECT(vireo_auth_sessions_create(f->server,&bo,&f->sessions),VIREO_OK);
     client_open(f,establish);
 }
+static inline void setup_capacity(fixture_t *f,bool establish,size_t capacity)
+{ setup_capacity_profile(f,establish,capacity,4096); }
 static inline void setup(fixture_t *f,bool establish) { setup_capacity(f,establish,1); }
 static inline void client_close(fixture_t *f) {
     if(f->client.pool_id) EXPECT(vireo_tcp_server_release_client(f->server,&f->client,NULL),VIREO_OK);

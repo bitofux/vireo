@@ -13,7 +13,7 @@ typedef struct vireo_directory_root_reactor_report {
     size_t deadline_downgraded; /**< 身份有效且到期，首次enqueue TIMEOUT数。 */
     bool response_blocked; /**< 本轮ROOT本地拒绝或结果曾受FIFO背压。 */
     bool completion_pending; /**< 返回时服务仍有ROOT completion owner。 */
-    size_t expected_requests; /**< 返回时六命令镜像提交项数，含take后待交付项。 */
+    size_t expected_requests; /**< 返回时所有已启用命令镜像提交项数，含take后待交付项。 */
 } vireo_directory_root_reactor_report_t;
 /**
  * @brief 创建显式启用六命令的单一TLS服务owner

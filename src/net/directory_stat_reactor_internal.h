@@ -91,7 +91,9 @@ typedef struct vireo_root_reactor_ops {
     vireo_result_t (*submit)(void *,vireo_inflight_store_t *,vireo_tcp_server_t const *,vireo_thread_pool_t *,size_t,vireo_task_t **,vireo_inflight_submit_report_t *); /**< 原transfer/rollback合同。 */
     vireo_result_t (*create_task)(void *,vireo_task_metadata_t,uint32_t,unsigned char const *,size_t,vireo_mysql_node_actor_t const *,size_t,vireo_task_t **); /**< 原ROOT task创建合同；无cancel。 */
 } vireo_root_reactor_ops_t;
+typedef struct vireo_list_reactor_state vireo_list_reactor_state_t;
 struct vireo_auth_service {
+    vireo_list_reactor_state_t *list; /**< NULL为旧四/五/六模式。 */
     vireo_auth_service_resources_t r;
     vireo_auth_service_options_t o;
     vireo_event_loop_handle_t handle;

@@ -29,9 +29,9 @@ static inline vireo_auth_service_options_t service_options(void)
         .max_client_requests=8,.register_operation=100,.login_operation=101,.logout_operation=102,.resume_operation=103,
         .request_timeout_ns=REQUEST_TIMEOUT,.max_memory_bytes=65536};
 }
-static inline void service_setup(service_fixture_t *t,vireo_thread_pool_execute_fn execute,void *context)
+static inline void service_setup_profile(service_fixture_t *t,vireo_thread_pool_execute_fn execute,void *context,size_t write_capacity)
 {
-    *t=(service_fixture_t){0}; setup(&t->f,false); client_close(&t->f);
+    *t=(service_fixture_t){0}; setup_capacity_profile(&t->f,false,1,write_capacity); client_close(&t->f);
     vireo_task_queue_options_t const qo={1,65536};
     EXPECT(vireo_task_queue_create(&qo,&t->tasks),VIREO_OK); EXPECT(vireo_task_queue_prepare_wait(t->tasks),VIREO_OK);
     vireo_thread_pool_options_t const wo={1,65536};
@@ -50,6 +50,8 @@ static inline void service_setup(service_fixture_t *t,vireo_thread_pool_execute_
     EXPECT(vireo_thread_pool_start(t->workers,&report),VIREO_OK);
     EXPECT(vireo_thread_pool_enable_execution(t->workers,&report),VIREO_OK);
 }
+static inline void service_setup(service_fixture_t *t,vireo_thread_pool_execute_fn execute,void *context)
+{ service_setup_profile(t,execute,context,4096); }
 static inline void service_create(service_fixture_t *t)
 {
     vireo_auth_service_resources_t const r={t->f.server,t->f.store,t->workers,t->admission,t->f.sessions,t->queue,t->notifier,t->audit};

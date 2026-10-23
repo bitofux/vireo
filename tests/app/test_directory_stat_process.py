@@ -129,7 +129,7 @@ def real(server, helper, endpoint, user, password_file, database):
         assert 'AddressSanitizer' not in data and 'runtime error:' not in data
         v = {k: int(n) for k, n in re.findall(r'(\w+)=(-?\d+)', data)}
         assert v['clean'] == 1 and v['cleanup'] == 0 and v['created'] == v['joined'] == 2
-        expected_close, expected_drain = (7, 6) if 'fd_before' in v else (15, 14)
+        expected_close, expected_drain = (7, 6) if 'fd_before' in v else (31, 30)
         assert v['queues_closed'] == expected_close and v['queues_drained'] == expected_drain and v['final_drain_turns'] >= 1
         assert v['audit_created'] == v['audit_joined']
         if 'fd_before' in v:
@@ -272,7 +272,7 @@ def real(server, helper, endpoint, user, password_file, database):
                 stat_response(malformed, sequence, 1101 if valid else 1001)
         bad_frames = [bytearray(stat_frame(1, root_id)),
                       bytearray(packet(0x402, 1, bytes(125))),
-                      bytearray(packet(0x401, 1)),
+                      bytearray(packet(0x407, 1)),
                       bytearray(packet(0x402, 0, tlv(0x401, struct.pack('!Q', root_id)))),
                       bytearray(packet(0x402, 1, flags=0x8000))]
         bad_frames[0][-1] ^= 1

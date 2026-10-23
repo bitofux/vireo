@@ -1,7 +1,7 @@
 /* PROJECT: VIREO; FILE: directory_stat_reactor.c; DATE: 2026-10-22.
  * 同一Reactor的STAT准入、独立关联和可恢复交付；不向网络发送VDC1。 */
 #define _POSIX_C_SOURCE 200809L
-#include "directory_stat_reactor_internal.h"
+#include "directory_list_reactor_internal.h"
 #include <vireo/base/checked.h>
 #include <errno.h>
 #include <time.h>
@@ -63,6 +63,7 @@ vireo_result_t vireo_stat_reactor_reserve(vireo_auth_service_t *s,vireo_connecti
     *index=SIZE_MAX;
     if(store.count==store.capacity) return VIREO_OK;
     if(free_index==SIZE_MAX) return fatal(s,VIREO_RESULT_INTERNAL);
+    vireo_list_reactor_clear_request(s,free_index);
     s->expected[free_index]=(vireo_stat_expected_t){.command=command,
         .metadata.route={.client_owner_id=c.pool_id,.client_slot_index=c.slot_index,
             .client_generation=c.generation,.request_sequence=sequence}};
@@ -84,7 +85,7 @@ vireo_result_t vireo_stat_reactor_commit_auth(vireo_auth_service_t *s,size_t ind
 void vireo_stat_reactor_forget(vireo_auth_service_t *s,vireo_task_metadata_t m)
 {
     vireo_stat_expected_t *e=expected(s,m);
-    if(e) { *e=(vireo_stat_expected_t){0}; --s->expected_count; }
+    if(e) { vireo_list_reactor_clear_request(s,(size_t)(e-s->expected)); *e=(vireo_stat_expected_t){0}; --s->expected_count; }
 }
 /** 当前完整客户的发送资格；BUSY/NOT_FOUND/CANCELLED仅表示不能继续交付。 */
 static vireo_result_t transport(vireo_auth_service_t const *s,vireo_connection_pool_lease_t c)

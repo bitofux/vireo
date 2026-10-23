@@ -2,7 +2,11 @@
 
 Vireo 是使用 C11 编写、面向 Linux 的事件驱动对象存储与虚拟文件服务项目。
 
-当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT 和 NODE_STAT，使用 MySQL 保存身份和目录元数据。LIST 已有协议与同步业务层，网络分页仍在开发；上传、下载和完整客户端尚未完成。
+当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT、NODE_STAT 和 NODE_LIST，使用 MySQL 保存身份和目录元数据。LIST 支持带分页 token 的目录遍历；上传、下载和完整客户端尚未完成。
+
+认证后先用 NODE_ROOT 获取真实根 ID，再以显式目录 ID 和每页 1～64 项调用 NODE_LIST。响应带 MORE 时，用新的请求 sequence 和返回的 96 字节 token 获取下一页；token 绑定用户、持久会话、目录和页大小，整条分页链有效期为 10 分钟。同一持久会话通过 RESUME 恢复后可继续，新 LOGIN 或服务重启会使旧 token 失效。
+
+分页按节点 ID 递增，每页重新授权，不提供跨页快照或总数。翻页期间目录发生变化可能影响后续页；节点 ID 和 token 都不是授权凭据。
 
 ## 构建与测试
 

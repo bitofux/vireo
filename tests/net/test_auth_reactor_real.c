@@ -214,7 +214,28 @@ int main(int argc,char **argv)
     EXPECT(vireo_auth_response_clear(&late),VIREO_OK); EXPECT(vireo_auth_response_clear(&revoked),VIREO_OK);
     client_close(&g);
     vireo_thread_pool_shutdown_report_t shutdown;
-    EXPECT(vireo_thread_pool_shutdown_and_join(workers,VIREO_TASK_QUEUE_DRAIN,&shutdown),VIREO_OK); REQUIRE(shutdown.pool_report.joined_count==2);
+    uint64_t shutdown_start=0, shutdown_now=0;
+    EXPECT(vireo_clock_monotonic_now(&shutdown_start,NULL),VIREO_OK);
+    for (;;) {
+        vireo_result_t const rc=vireo_thread_pool_shutdown_and_join(workers,VIREO_TASK_QUEUE_DRAIN,&shutdown);
+        if (rc==VIREO_OK) break;
+        /* 只重试公开队列的无进度锁竞争，不吞掉worker或join错误。 */
+        REQUIRE(rc==VIREO_RESULT_BUSY);
+        if (shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_CLOSE_QUEUE) {
+            REQUIRE(shutdown.close_called && !shutdown.join_called && !shutdown.close_report.changed &&
+                shutdown.close_report.stage==VIREO_TASK_QUEUE_STAGE_LOCK &&
+                shutdown.close_report.pthread_error==EBUSY);
+        } else {
+            REQUIRE(shutdown.stage==VIREO_THREAD_POOL_SHUTDOWN_STAGE_JOIN_WORKERS &&
+                shutdown.close_called && shutdown.join_called &&
+                shutdown.pool_report.stage==VIREO_THREAD_POOL_STAGE_CHECK_QUEUE &&
+                !shutdown.pool_report.pthread_error && !shutdown.pool_report.joined_count);
+        }
+        EXPECT(vireo_clock_monotonic_now(&shutdown_now,NULL),VIREO_OK);
+        REQUIRE(shutdown_now-shutdown_start<UINT64_C(5000000000));
+        sched_yield();
+    }
+    REQUIRE(shutdown.pool_report.joined_count==2);
     EXPECT(vireo_auth_session_revoke(f.sessions,bound.session_id),VIREO_OK);
     EXPECT(vireo_auth_session_lookup(f.sessions,f.client,handle,utc_ms(),&bound),VIREO_RESULT_CANCELLED);
     vireo_connection_pool_lease_t const old=f.client; client_close(&f); client_open(&f,true);
