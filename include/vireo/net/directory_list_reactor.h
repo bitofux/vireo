@@ -13,7 +13,7 @@ typedef struct vireo_directory_list_reactor_report {
     size_t deadline_downgraded; /**< 身份有效且软期限已到，首次enqueue TIMEOUT数。 */
     bool response_blocked; /**< 本轮本地拒绝或整页响应遇到FIFO空间不足。 */
     bool completion_pending; /**< 返回时尚有本服务独占LIST completion owner。 */
-    size_t expected_requests; /**< 返回时所有七命令已提交镜像数，含take后待交付。 */
+    size_t expected_requests; /**< 返回时所有已启用命令已提交镜像数，含take后待交付。 */
     size_t completion_bytes_charged; /**< 每次消费尝试预留23558字节的累计额，不是实际wire/RSS。 */
 } vireo_directory_list_reactor_report_t;
 /**

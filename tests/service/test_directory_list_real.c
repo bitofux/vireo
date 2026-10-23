@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
     vireo_mysql_migration_report_t migration;
     CHECK(vireo_mysql_migration_apply(thread, &options, catalog, count, &migration, NULL),
           VIREO_OK);
-    assert(migration.ready && migration.steps_completed == 14);
+    assert(migration.ready && migration.steps_completed == 15);
     CHECK(vireo_mysql_connection_open(thread, &options, &observer, NULL), VIREO_OK);
     vireo_mysql_pool_t *pool = NULL;
     const vireo_mysql_pool_options_t pool_options = {options, 2, 2, VIREO_MYSQL_POOL_MEMORY_MAX};

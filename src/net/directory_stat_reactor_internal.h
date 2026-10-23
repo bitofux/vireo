@@ -8,6 +8,7 @@
 #include <vireo/service/directory_root_completion.h>
 #include <vireo/net/auth_service_deadline.h>
 #include <vireo/net/client_deadline.h>
+#include <vireo/protocol/node_mkdir.h>
 
 /** 每客户一个timer指向phase/frame的较早期限；完整绑定兼顾两种代次。 */
 typedef struct vireo_auth_client_deadline {
@@ -92,7 +93,9 @@ typedef struct vireo_root_reactor_ops {
     vireo_result_t (*create_task)(void *,vireo_task_metadata_t,uint32_t,unsigned char const *,size_t,vireo_mysql_node_actor_t const *,size_t,vireo_task_t **); /**< 原ROOT task创建合同；无cancel。 */
 } vireo_root_reactor_ops_t;
 typedef struct vireo_list_reactor_state vireo_list_reactor_state_t;
+typedef struct vireo_mkdir_reactor_state vireo_mkdir_reactor_state_t;
 struct vireo_auth_service {
+    vireo_mkdir_reactor_state_t *mkdir; /**< NULL为原四至七命令模式。 */
     vireo_list_reactor_state_t *list; /**< NULL为旧四/五/六模式。 */
     vireo_auth_service_resources_t r;
     vireo_auth_service_options_t o;
@@ -128,6 +131,12 @@ struct vireo_auth_service {
     size_t deadline_capacity;
     vireo_result_t (*deadline_now)(uint64_t *,vireo_clock_error_t *); /**< 默认公开CLOCK_MONOTONIC；本层测试可替换。 */
 };
+
+/** 共同framing可观察上界；命令专用上界在完整header后立即验证。 */
+static inline size_t vireo_auth_frame_max(vireo_auth_service_t const *s)
+{ return s->mkdir?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
+static inline size_t vireo_auth_command_frame_max(vireo_auth_service_t const *s,vireo_command_t command)
+{ return s->mkdir && command==VIREO_COMMAND_NODE_MKDIR?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
 
 /** 本层统一关闭意图，幂等记账；release成功后才归还closing_count。 */
 static inline void vireo_auth_service_close_slot(vireo_auth_service_t *s,client_slot_t *slot)

@@ -154,7 +154,7 @@ int main(int argc,char **argv)
     const vireo_mysql_migration_t *catalog=NULL; size_t count=0;
     CHECK(vireo_mysql_schema_catalog(&catalog,&count),VIREO_OK); vireo_mysql_migration_report_t migrated;
     CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&migrated,NULL),VIREO_OK);
-    assert(migrated.ready && migrated.steps_completed==14);
+    assert(migrated.ready && migrated.steps_completed==15);
     vireo_mysql_connection_t *observer=NULL; CHECK(vireo_mysql_connection_open(thread,&options,&observer,NULL),VIREO_OK);
     const vireo_mysql_pool_options_t po={options,2,2,VIREO_MYSQL_POOL_MEMORY_MAX}; vireo_mysql_pool_t *pool=NULL;
     CHECK(vireo_mysql_pool_create(thread,&po,&pool,NULL),VIREO_OK);

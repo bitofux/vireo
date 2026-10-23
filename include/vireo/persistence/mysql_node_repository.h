@@ -55,7 +55,9 @@ typedef enum vireo_mysql_node_issue {
     VIREO_MYSQL_NODE_ANCESTRY_LIMIT, /**< 任一链超过256项仍未到根，RANGE且不提交。 */
     VIREO_MYSQL_NODE_ROOT_UNDELETABLE, /**< 有效身份下本用户活动根不可删除，DATABASE。 */
     VIREO_MYSQL_NODE_DIRECTORY_NOT_EMPTY, /**< 目录含直接ACTIVE/UPLOADING孩子，DATABASE。 */
-    VIREO_MYSQL_NODE_OBJECT_REFERENCE_INVALID /**< 对象缺失/大小不符/零引用/DELETING，DATABASE。 */
+    VIREO_MYSQL_NODE_OBJECT_REFERENCE_INVALID, /**< 对象缺失/大小不符/零引用/DELETING，DATABASE。 */
+    VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT, /**< 已提交回执的原parent/name与本次不同，DATABASE。 */
+    VIREO_MYSQL_NODE_RECEIPT_INVALID /**< 回执行/固定版本/键或历史结果形状不合法，DATABASE且不重建。 */
 } vireo_mysql_node_issue_t;
 /** @brief 首因或首清理失败阶段，无任意文本。 */
 typedef enum vireo_mysql_node_stage {
@@ -83,7 +85,9 @@ typedef enum vireo_mysql_node_stage {
     VIREO_MYSQL_NODE_STAGE_CHILDREN, /**< 删除目录前查一个活动/上传中孩子见证。 */
     VIREO_MYSQL_NODE_STAGE_SOFT_DELETE, /**< 源节点ACTIVE转DELETED并记录时间。 */
     VIREO_MYSQL_NODE_STAGE_OBJECT, /**< 文件所指对象的完整行排他锁读。 */
-    VIREO_MYSQL_NODE_STAGE_OBJECT_UPDATE /**< 同事务对象活动引用数减一。 */
+    VIREO_MYSQL_NODE_STAGE_OBJECT_UPDATE, /**< 同事务对象活动引用数减一。 */
+    VIREO_MYSQL_NODE_STAGE_RECEIPT_READ, /**< 锁读/解析完整键的历史成功回执。 */
+    VIREO_MYSQL_NODE_STAGE_RECEIPT_INSERT /**< 三写同事务的成功回执INSERT。 */
 } vireo_mysql_node_stage_t;
 /** @brief 业务命中与资源清理事实，返回非OK仍须检查。 */
 typedef struct vireo_mysql_node_report {

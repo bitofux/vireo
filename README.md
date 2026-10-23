@@ -2,7 +2,7 @@
 
 Vireo 是使用 C11 编写、面向 Linux 的事件驱动对象存储与虚拟文件服务项目。
 
-当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT、NODE_STAT 和 NODE_LIST，使用 MySQL 保存身份和目录元数据。LIST 支持带分页 token 的目录遍历；上传、下载和完整客户端尚未完成。
+当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT、NODE_STAT、NODE_LIST 和 NODE_MKDIR，使用 MySQL 保存身份和目录元数据。LIST 支持带分页 token 的目录遍历，MKDIR 支持幂等创建目录；上传、下载和完整客户端尚未完成。
 
 认证后先用 NODE_ROOT 获取真实根 ID，再以显式目录 ID 和每页 1～64 项调用 NODE_LIST。响应带 MORE 时，用新的请求 sequence 和返回的 96 字节 token 获取下一页；token 绑定用户、持久会话、目录和页大小，整条分页链有效期为 10 分钟。同一持久会话通过 RESUME 恢复后可继续，新 LOGIN 或服务重启会使旧 token 失效。
 
@@ -10,7 +10,7 @@ Vireo 是使用 C11 编写、面向 Linux 的事件驱动对象存储与虚拟�
 
 ## 构建与测试
 
-需要 C11 编译器、CMake 3.20+、pthread、OpenSSL 3.x、pkg-config、libargon2（20190702+）和 MySQL 客户端开发库。启用测试还需要 Python 3、`mysqld` 和 `mysql`；数据库集成测试会自动创建独立本地实例。
+需要 C11 编译器、CMake 3.20+、pthread、OpenSSL 3.x、pkg-config、libargon2（20190702+）、utf8proc 2.9.0（Unicode 15.1.0 名字政策基线）和 MySQL 客户端开发库。启用测试还需要 Python 3、`mysqld` 和 `mysql`；数据库集成测试会自动创建独立本地实例。
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
@@ -20,6 +20,12 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 ctest --test-dir build --output-on-failure
 ```
+
+Ubuntu 24.04 可安装 `libutf8proc-dev=2.9.0-1build1` 与 `libutf8proc3=2.9.0-1build1`。该 Ubuntu 包的 pkg-config 版本为 ABI `3.0.0`；构建配置会实际编译并运行探针核验头文件 2.9.0、运行库 2.9.0 和 Unicode 15.1.0。新目录名字由同步服务检查 UTF-8、单段 NAME 规则和 NFC；非 NFC 拒绝且不改写输入。旧数据读取保持原字节。
+
+NODE_MKDIR 接收当前 session handle、显式父目录 ID、1～255 字节的 NFC 名字和非零 16 字节幂等键。同一用户重试须保留原父 ID、名字和键；成功回执可恢复原目录 ID，即使该目录后来已移动或软删除。超时、断开或 DB_ERROR 不能证明未写入，调用者应使用同一请求恢复。服务不会自动重试 SQL。
+
+生产 Reactor 使用五个完成队列共享通知器；每个客户端八命令合计最多保留八个未交付请求，重复未完成 sequence 会关闭连接。MKDIR 最大请求为 323 字节，生产读单元/低水位为 512/511 字节。首次将结果写入发送 FIFO 前重新检查当前身份和期限；入队不能证明客户端已收到。新增 Reactor、worker runtime 与真实 TLS/MySQL 进程测试覆盖满载、幂等恢复和故障停机。
 
 构建默认启用严格警告。真实 MySQL 测试需要足够的临时目录空间，夹具保留诊断和数据库数据；可用 `TMPDIR` 指定所在文件系统。
 

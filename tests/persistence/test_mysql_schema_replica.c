@@ -21,11 +21,11 @@ static void hash_u32(EVP_MD_CTX *ctx, uint32_t v)
 int main(void)
 {
     const vireo_mysql_migration_t *catalog=NULL; size_t count=0;
-    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==8);
+    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==9);
     assert(count<=VIREO_MYSQL_MIGRATIONS_MAX);
     size_t total=0;
     for(size_t v=0;v<count;++v) {
-        assert(catalog[v].version==v+1 && catalog[v].step_count==(v==2 || v==7 ? 1U : 2U));
+        assert(catalog[v].version==v+1 && catalog[v].step_count==(v==2 || v==7 || v==8 ? 1U : 2U));
         assert(catalog[v].step_count<=VIREO_MYSQL_MIGRATION_STEPS_MAX);
         for(size_t i=0;i<catalog[v].step_count;++i) {
             const vireo_mysql_migration_step_t *step=&catalog[v].steps[i];
@@ -67,6 +67,6 @@ int main(void)
     unsigned char digest[32]; unsigned int length=0;
     assert(EVP_DigestFinal_ex(ctx,digest,&length)==1 && length==32);
     EVP_MD_CTX_free(ctx); assert(!memcmp(digest,expected,32));
-    puts("PASS replica catalog: eight versions, 2/2/1/2/2/2/2/1 steps, twelve constants, independent v6 SHA-256");
+    puts("PASS replica catalog: nine versions, 2/2/1/2/2/2/2/1/1 steps, twelve constants, independent v6 SHA-256");
     return 0;
 }

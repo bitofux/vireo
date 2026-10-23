@@ -23,11 +23,11 @@ static void hash_u32(EVP_MD_CTX *ctx, uint32_t v)
 int main(void)
 {
     const vireo_mysql_migration_t *catalog=NULL; size_t count=0;
-    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==8);
+    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==9);
     assert(count<=VIREO_MYSQL_MIGRATIONS_MAX);
     size_t total=0;
     for(size_t v=0;v<count;++v) {
-        assert(catalog[v].version==v+1 && catalog[v].step_count==(v==2 || v==7 ? 1U : 2U));
+        assert(catalog[v].version==v+1 && catalog[v].step_count==(v==2 || v==7 || v==8 ? 1U : 2U));
         assert(catalog[v].step_count<=VIREO_MYSQL_MIGRATION_STEPS_MAX);
         for(size_t i=0;i<catalog[v].step_count;++i) {
             const vireo_mysql_migration_step_t *step=&catalog[v].steps[i];

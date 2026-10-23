@@ -143,7 +143,7 @@ vireo_result_t vireo_auth_deadline_frames(vireo_auth_service_t *s,client_slot_t 
         rc=vireo_protocol_header_decode(wire+offset,size-offset,&h,&issue);
         if(rc==VIREO_OK) rc=vireo_protocol_request_header_validate(&h,&issue);
         if(rc!=VIREO_OK) return rc;
-        if(h.body_len>VIREO_AUTH_REQUEST_FRAME_MAX-VIREO_PROTOCOL_HEADER_SIZE) return VIREO_RESULT_PROTOCOL;
+        if(h.body_len>vireo_auth_command_frame_max(s,h.command)-VIREO_PROTOCOL_HEADER_SIZE) return VIREO_RESULT_PROTOCOL;
         size_t const bytes=VIREO_PROTOCOL_HEADER_SIZE+(size_t)h.body_len;
         if(bytes>size-offset) break;
         offset+=bytes;

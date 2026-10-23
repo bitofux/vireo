@@ -43,6 +43,10 @@ jobs:
         run: |
           sudo apt-get install --no-install-recommends -y libmysqlclient-dev mysql-server-core-8.0 mysql-client-core-8.0
 
+      - name: Install NFC name policy dependency
+        run: |
+          sudo apt-get install --no-install-recommends -y libutf8proc-dev=2.9.0-1build1 libutf8proc3=2.9.0-1build1
+
       - name: Configure
         run: |
           cmake \
@@ -91,6 +95,10 @@ jobs:
       - name: Install MySQL development and isolated test dependencies
         run: |
           sudo apt-get install --no-install-recommends -y libmysqlclient-dev mysql-server-core-8.0 mysql-client-core-8.0
+
+      - name: Install NFC name policy dependency
+        run: |
+          sudo apt-get install --no-install-recommends -y libutf8proc-dev=2.9.0-1build1 libutf8proc3=2.9.0-1build1
 
       - name: Configure
         run: |

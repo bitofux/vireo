@@ -3,7 +3,7 @@
  * FILE    : mysql_schema.c
  * AUTHOR  : bitofux
  * DATE    : 2026-10-18
- * BRIEF   : v1认证、v2节点、v3审计、v4上传及v5永久块/manifest、v6节点/副本及v7下载及v8清理任务可信DDL；精确字节属于持久迁移hash合同。
+ * BRIEF   : v1认证、v2节点、v3审计、v4上传及v5永久块/manifest、v6节点/副本及v7下载、v8清理任务及v9目录成功回执可信DDL；精确字节属于持久迁移hash合同。
  */
 #include <vireo/persistence/mysql_schema.h>
 
@@ -439,6 +439,31 @@ static const char gc_jobs_sql[] =
 static const vireo_mysql_migration_step_t gc_steps[] = {
     {gc_jobs_sql, sizeof(gc_jobs_sql)-1}
 };
+static const char directory_write_receipts_sql[] =
+    "CREATE TABLE directory_write_receipts (\n"
+    "    user_id BIGINT UNSIGNED NOT NULL,\n"
+    "    command SMALLINT UNSIGNED NOT NULL,\n"
+    "    idempotency_key VARBINARY(16) NOT NULL,\n"
+    "    format_version SMALLINT UNSIGNED NOT NULL,\n"
+    "    request_parent_id BIGINT UNSIGNED NOT NULL,\n"
+    "    request_name VARBINARY(255) NOT NULL,\n"
+    "    result_node_id BIGINT UNSIGNED NOT NULL,\n"
+    "    audit_id BIGINT UNSIGNED NOT NULL,\n"
+    "    created_at_ms BIGINT UNSIGNED NOT NULL,\n"
+    "    PRIMARY KEY (user_id,command,idempotency_key),\n"
+    "    CONSTRAINT directory_receipts_user_valid CHECK (user_id>0) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_command_valid CHECK (command=1027) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_key_valid CHECK (OCTET_LENGTH(idempotency_key)=16 AND idempotency_key<>REPEAT(X'00',16)) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_format_valid CHECK (format_version=1) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_parent_valid CHECK (request_parent_id>0) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_name_valid CHECK (OCTET_LENGTH(request_name) BETWEEN 1 AND 255 AND request_name NOT IN (X'2E',X'2E2E') AND LOCATE(X'2F',request_name)=0 AND LOCATE(X'00',request_name)=0) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_node_valid CHECK (result_node_id>0) ENFORCED,\n"
+    "    CONSTRAINT directory_receipts_audit_valid CHECK (audit_id>0) ENFORCED\n"
+    ") ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin\n";
+
+static const vireo_mysql_migration_step_t directory_receipt_steps[] = {
+    {directory_write_receipts_sql, sizeof(directory_write_receipts_sql)-1}
+};
 static const vireo_mysql_migration_t catalog[] = {
     {1, initial_steps, 2},
     {2, node_steps, 2},
@@ -447,7 +472,8 @@ static const vireo_mysql_migration_t catalog[] = {
     {5, manifest_steps, 2},
     {6, replica_steps, 2},
     {7, download_steps, 2},
-    {8, gc_steps, 1}
+    {8, gc_steps, 1},
+    {9, directory_receipt_steps, 1}
 };
 
 vireo_result_t vireo_mysql_schema_catalog(

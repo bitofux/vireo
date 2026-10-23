@@ -165,7 +165,7 @@ int main(int argc, char **argv)
     CHECK(vireo_mysql_schema_catalog(&catalog, &count), VIREO_OK);
     vireo_mysql_migration_report_t migration;
     CHECK(vireo_mysql_migration_apply(thread, &options, catalog, count, &migration, NULL), VIREO_OK);
-    assert(migration.ready && migration.steps_completed == 14);
+    assert(migration.ready && migration.steps_completed == 15);
     vireo_mysql_connection_t *observer = NULL;
     CHECK(vireo_mysql_connection_open(thread, &options, &observer, NULL), VIREO_OK);
     vireo_mysql_pool_options_t const pool_options = {options, 1, 1, VIREO_MYSQL_POOL_MEMORY_MAX};

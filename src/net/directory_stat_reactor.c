@@ -1,7 +1,7 @@
 /* PROJECT: VIREO; FILE: directory_stat_reactor.c; DATE: 2026-10-22.
  * 同一Reactor的STAT准入、独立关联和可恢复交付；不向网络发送VDC1。 */
 #define _POSIX_C_SOURCE 200809L
-#include "directory_list_reactor_internal.h"
+#include "directory_mkdir_reactor_internal.h"
 #include <vireo/base/checked.h>
 #include <errno.h>
 #include <time.h>
@@ -61,9 +61,19 @@ vireo_result_t vireo_stat_reactor_reserve(vireo_auth_service_t *s,vireo_connecti
     vireo_inflight_store_info_t store;
     vireo_result_t rc=vireo_inflight_store_inspect(s->r.store,&store); if(rc!=VIREO_OK) return fatal(s,rc);
     *index=SIZE_MAX;
+    if(s->mkdir) {
+        size_t count=0;
+        for(size_t i=0;i<s->expected_capacity;++i) {
+            vireo_stat_expected_t const *e=&s->expected[i];
+            if(e->command && e->committed && same_client(client_of(e->metadata),c)) ++count;
+        }
+        size_t const limit=s->o.max_client_requests<8?s->o.max_client_requests:8;
+        if(count>=limit) return VIREO_OK;
+    }
     if(store.count==store.capacity) return VIREO_OK;
     if(free_index==SIZE_MAX) return fatal(s,VIREO_RESULT_INTERNAL);
     vireo_list_reactor_clear_request(s,free_index);
+    vireo_mkdir_reactor_clear_request(s,free_index);
     s->expected[free_index]=(vireo_stat_expected_t){.command=command,
         .metadata.route={.client_owner_id=c.pool_id,.client_slot_index=c.slot_index,
             .client_generation=c.generation,.request_sequence=sequence}};
@@ -85,7 +95,7 @@ vireo_result_t vireo_stat_reactor_commit_auth(vireo_auth_service_t *s,size_t ind
 void vireo_stat_reactor_forget(vireo_auth_service_t *s,vireo_task_metadata_t m)
 {
     vireo_stat_expected_t *e=expected(s,m);
-    if(e) { vireo_list_reactor_clear_request(s,(size_t)(e-s->expected)); *e=(vireo_stat_expected_t){0}; --s->expected_count; }
+    if(e) { vireo_list_reactor_clear_request(s,(size_t)(e-s->expected)); vireo_mkdir_reactor_clear_request(s,(size_t)(e-s->expected)); *e=(vireo_stat_expected_t){0}; --s->expected_count; }
 }
 /** 当前完整客户的发送资格；BUSY/NOT_FOUND/CANCELLED仅表示不能继续交付。 */
 static vireo_result_t transport(vireo_auth_service_t const *s,vireo_connection_pool_lease_t c)

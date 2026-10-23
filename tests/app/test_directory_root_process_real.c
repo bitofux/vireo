@@ -31,7 +31,7 @@ int main(int argc,char **argv)
         bool reported=false;
         vireo_auth_process_options_t const o={argv[2],(uint16_t)strtoul(argv[3],NULL,10),argv[4],argv[5],argv[6],argv[7],argv[8],argv[9],
             (uint64_t)strtoull(argv[10],NULL,10),(size_t)strtoull(argv[11],NULL,10),observe_audit,&reported,
-            (size_t)strtoull(argv[12],NULL,10),(size_t)strtoull(argv[13],NULL,10),0};
+            (size_t)strtoull(argv[12],NULL,10),(size_t)strtoull(argv[13],NULL,10),0,0};
         vireo_auth_process_report_t r; errno=EDOM;
         vireo_result_t rc=vireo_auth_process_run(&o,&r);
         if (errno!=EDOM) abort();

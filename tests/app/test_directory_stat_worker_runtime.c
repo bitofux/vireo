@@ -244,7 +244,19 @@ static void close_three_queues(void)
     for(uint32_t i=0;i<2;++i) {
         vireo_task_metadata_t meta=metadata();meta.operation=400+i;meta.route.request_sequence=i+1;meta.request_instance_id=i+1;
         vireo_task_t *t=NULL;CHECK(vireo_task_create_copy(meta,"x",1,4096,&t),VIREO_OK);
-        vireo_thread_pool_submit_report_t moved;CHECK(vireo_thread_pool_try_submit(workers,&t,&moved),VIREO_OK);assert(!t);
+        /* Workers already consume the queue: its nonwaiting lock may return BUSY.
+         * Retry only a queue-stage rejection that retained this exact task. */
+        uint64_t submit_start=0,submit_now=0;CHECK(vireo_clock_monotonic_now(&submit_start,NULL),VIREO_OK);
+        vireo_thread_pool_submit_report_t moved;vireo_result_t submitted=VIREO_RESULT_BUSY;
+        for(size_t attempt=0;attempt<100000 && submitted==VIREO_RESULT_BUSY;++attempt) {
+            errno=EDOM;submitted=vireo_thread_pool_try_submit(workers,&t,&moved);assert(errno==EDOM);
+            if(submitted==VIREO_RESULT_BUSY) {
+                assert(moved.stage==VIREO_THREAD_POOL_SUBMIT_STAGE_SUBMIT_QUEUE && moved.queue_called && !moved.queue_report.transferred && t);
+                assert(sched_yield()==0);CHECK(vireo_clock_monotonic_now(&submit_now,NULL),VIREO_OK);
+                assert(submit_now-submit_start<UINT64_C(10000000000));
+            }
+        }
+        CHECK(submitted,VIREO_OK);assert(!t && moved.queue_report.transferred);
     }
     uint64_t start=0,now=0;CHECK(vireo_clock_monotonic_now(&start,NULL),VIREO_OK);
     while(atomic_load_explicit(&f.first,memory_order_acquire)<2 || atomic_load_explicit(&f.attempting,memory_order_acquire)<2) {
