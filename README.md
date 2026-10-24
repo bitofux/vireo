@@ -2,7 +2,7 @@
 
 Vireo 是使用 C11 编写、面向 Linux 的事件驱动对象存储与虚拟文件服务项目。
 
-当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT、NODE_STAT、NODE_LIST 和 NODE_MKDIR，使用 MySQL 保存身份和目录元数据。LIST 支持带分页 token 的目录遍历，MKDIR 支持幂等创建目录；上传、下载和完整客户端尚未完成。
+当前可运行入口是 `vireo-auth-server`：提供 TLS 1.3 下的 REGISTER、LOGIN、LOGOUT、SESSION_RESUME、NODE_ROOT、NODE_STAT、NODE_LIST、NODE_MKDIR 和 NODE_MOVE，使用 MySQL 保存身份和目录元数据。LIST 支持带分页 token 的目录遍历，MKDIR 支持幂等创建目录，MOVE 支持保留节点 ID 的可恢复移动与改名；上传、下载和完整客户端尚未完成。
 
 认证后先用 NODE_ROOT 获取真实根 ID，再以显式目录 ID 和每页 1～64 项调用 NODE_LIST。响应带 MORE 时，用新的请求 sequence 和返回的 96 字节 token 获取下一页；token 绑定用户、持久会话、目录和页大小，整条分页链有效期为 10 分钟。同一持久会话通过 RESUME 恢复后可继续，新 LOGIN 或服务重启会使旧 token 失效。
 
@@ -25,7 +25,9 @@ Ubuntu 24.04 可安装 `libutf8proc-dev=2.9.0-1build1` 与 `libutf8proc3=2.9.0-1
 
 NODE_MKDIR 接收当前 session handle、显式父目录 ID、1～255 字节的 NFC 名字和非零 16 字节幂等键。同一用户重试须保留原父 ID、名字和键；成功回执可恢复原目录 ID，即使该目录后来已移动或软删除。超时、断开或 DB_ERROR 不能证明未写入，调用者应使用同一请求恢复。服务不会自动重试 SQL。
 
-生产 Reactor 使用五个完成队列共享通知器；每个客户端八命令合计最多保留八个未交付请求，重复未完成 sequence 会关闭连接。MKDIR 最大请求为 323 字节，生产读单元/低水位为 512/511 字节。首次将结果写入发送 FIFO 前重新检查当前身份和期限；入队不能证明客户端已收到。新增 Reactor、worker runtime 与真实 TLS/MySQL 进程测试覆盖满载、幂等恢复和故障停机。
+NODE_MOVE 接收当前 session handle、源节点 ID、显式最终父目录 ID、1～255 字节的 NFC 最终名字和非零 16 字节幂等键。同父改名、保名跨父及两者同时变化使用同一命令；同父同名的首次不变操作也保存成功回执。重试须保持原源 ID、最终父 ID、最终名字和键；历史成功只恢复原源 ID，不把后来又移动过的节点搬回。目录移动不递归修改后代直接 parent_id，文件移动不改变对象 hash、size 或 ref_count。根节点不可移动，禁止环及覆盖已有同名节点。超时、断连或 DB_ERROR 均不能证明未提交，不自动换键或重做 SQL。
+
+生产 Reactor 使用六个完成队列共享通知器；每个客户端九命令合计最多保留八个未交付请求，重复未完成 sequence 会关闭连接。MOVE 最大请求为 335 字节，MKDIR 保持 323 字节，生产读单元/低水位为 512/511 字节。首次将结果写入发送 FIFO 前重新检查当前身份和期限；入队不能证明客户端已收到。新增 Reactor、worker runtime 与真实 TLS/MySQL 进程测试覆盖满载、幂等恢复和故障停机。
 
 构建默认启用严格警告。真实 MySQL 测试需要足够的临时目录空间，夹具保留诊断和数据库数据；可用 `TMPDIR` 指定所在文件系统。
 

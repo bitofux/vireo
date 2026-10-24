@@ -25,7 +25,7 @@ int main(int argc,char **argv)
     if (argc!=10 || !positive(argv[2],&port) || port>UINT16_MAX || !positive(argv[9],&lifetime)) {
         fputs("vireo-auth-server invalid arguments; use --help\n",stderr); return EXIT_FAILURE;
     }
-    vireo_auth_process_options_t const options={argv[1],(uint16_t)port,argv[3],argv[4],argv[5],argv[6],argv[7],argv[8],lifetime,4096,NULL,NULL,4096,4096,32768,4096};
+    vireo_auth_process_options_t const options={argv[1],(uint16_t)port,argv[3],argv[4],argv[5],argv[6],argv[7],argv[8],lifetime,4096,NULL,NULL,4096,4096,32768,4096,4096};
     vireo_auth_process_report_t r;
     vireo_result_t rc=vireo_auth_process_run(&options,&r);
     fprintf(stderr,"vireo-auth-server exit result=%d phase=%d ready=%d clean=%d signal=%d faults_at_stop=%u final_faults=%u created=%zu joined=%zu worker=%d cleanup=%d\n",
@@ -44,5 +44,6 @@ int main(int argc,char **argv)
         " audit_contention=%" PRIu64 " audit_closed=%" PRIu64 " audit_disabled_drop=%" PRIu64 "\n",
         r.audit_queue.dropped_rate,r.audit_queue.dropped_full,r.audit_queue.dropped_contention,
         r.audit_queue.dropped_closed,r.audit_queue.dropped_disabled);
+    fprintf(stderr,"vireo-auth-server move move_faults_at_stop=%u move_final_faults=%u\n",r.move_faults_at_stop,r.move_final_faults);
     return rc==VIREO_OK?EXIT_SUCCESS:EXIT_FAILURE;
 }

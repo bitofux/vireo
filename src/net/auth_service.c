@@ -4,7 +4,7 @@
  * DATE : 2026-10-20
  * BRIEF : 只经公开边界组合认证服务；跨轮保留不可逆前缀和唯一owner。 */
 #define _POSIX_C_SOURCE 200809L
-#include "directory_mkdir_reactor_internal.h"
+#include "directory_move_reactor_internal.h"
 #include <vireo/base/secure_clear.h>
 #include "auth_request_rejection_internal.h"
 #include <vireo/base/checked.h>
@@ -79,6 +79,14 @@ static vireo_result_t cleanup(vireo_auth_service_t *s,client_slot_t *slot,vireo_
             rc=vireo_mkdir_reactor_discard(s); p->completions+=s->mkdir->report.completions-before; if(rc!=VIREO_OK) return rc;
         }
     }
+    if(s->move && s->move->completion) {
+        vireo_completion_info_t info;
+        rc=vireo_completion_inspect(s->move->completion,&info); if(rc!=VIREO_OK) return rc;
+        if(same(client_of(info.metadata.request),slot->client)) {
+            size_t const before=s->move->report.completions;
+            rc=vireo_move_reactor_discard(s); p->completions+=s->move->report.completions-before; if(rc!=VIREO_OK) return rc;
+        }
+    }
     rc=vireo_task_destroy(&slot->task); if(rc!=VIREO_OK) return rc;
     if(!slot->records_cleaned) {
         vireo_inflight_client_cleanup_report_t clean;
@@ -94,12 +102,14 @@ static vireo_result_t cleanup(vireo_auth_service_t *s,client_slot_t *slot,vireo_
             if(e->committed) --s->expected_count;
             vireo_list_reactor_clear_request(s,(size_t)(e-s->expected));
             vireo_mkdir_reactor_clear_request(s,(size_t)(e-s->expected));
+            vireo_move_reactor_clear_request(s,(size_t)(e-s->expected));
             *e=(vireo_stat_expected_t){0};
         }
     }
     if(slot->expected_cursor<s->expected_capacity) return VIREO_OK;
     rc=vireo_auth_session_forget(s->r.sessions,slot->client);
     if(rc!=VIREO_OK && rc!=VIREO_RESULT_NOT_FOUND) return rc;
+    if(s->move) (void)vireo_secure_clear(&s->move->heads[slot->client.slot_index],sizeof(*s->move->heads));
     if(s->mkdir) (void)vireo_secure_clear(&s->mkdir->heads[slot->client.slot_index],sizeof(*s->mkdir->heads));
     if(s->list) (void)vireo_secure_clear(&s->list->heads[slot->client.slot_index],sizeof(*s->list->heads));
     rc=vireo_tcp_server_release_client(s->r.server,&slot->client,NULL);
@@ -133,7 +143,7 @@ static vireo_result_t finish_head(vireo_auth_service_t *s,client_slot_t *slot,vi
     if(rc==VIREO_OK) slot->audit_decided=false;
     return rc;
 }
-/** 即使未启deadline，也先按完整header拒绝非MKDIR超旧156上界。 */
+/** 即使未启deadline，也先按完整header按命令拒绝超长帧，保留旧156及MKDIR323上界。 */
 static vireo_result_t peek_frame(vireo_auth_service_t *s,client_slot_t *slot,
     vireo_connection_frame_view_t *view,vireo_connection_frame_info_t *frames)
 {
@@ -158,6 +168,7 @@ static vireo_result_t application(vireo_auth_service_t *s,client_slot_t *slot,
 {
     size_t const submitted_before=p->submitted;
     vireo_list_head_t *lh=s->list?&s->list->heads[slot->client.slot_index]:NULL;
+    vireo_move_head_t *vh=s->move?&s->move->heads[slot->client.slot_index]:NULL;
     vireo_mkdir_head_t *mh=s->mkdir?&s->mkdir->heads[slot->client.slot_index]:NULL;
     vireo_tls_io_info_t io;
     vireo_result_t rc=vireo_tls_connection_io_inspect(tls,&io,NULL); if(rc!=VIREO_OK) return rc;
@@ -173,7 +184,7 @@ static vireo_result_t application(vireo_auth_service_t *s,client_slot_t *slot,
         rc=vireo_tls_connection_flow_refresh(tls,&flow,NULL); if(rc!=VIREO_OK) return rc;
     }
     /* 原首帧尚未消费时禁止receive改写其源；仍允许发送以腾写区。 */
-    if(slot->head.state!=VIREO_AUTH_REQUEST_HEAD_NEEDS_CONSUME && slot->stat_head.state!=1 && slot->root_head.state!=1 && (!lh || lh->state!=1) && (!mh || mh->state!=1) &&
+    if(slot->head.state!=VIREO_AUTH_REQUEST_HEAD_NEEDS_CONSUME && slot->stat_head.state!=1 && slot->root_head.state!=1 && (!lh || lh->state!=1) && (!mh || mh->state!=1) && (!vh || vh->state!=1) &&
        (flow.application_read_enabled || flow.priority_retry==VIREO_TLS_IO_OPERATION_READ)) {
         rc=vireo_tls_connection_receive(tls,&s->o.receive,&progress,NULL); if(rc!=VIREO_OK) return rc;
     }
@@ -183,7 +194,9 @@ static vireo_result_t application(vireo_auth_service_t *s,client_slot_t *slot,
         return rc;
     }
     if(slot->closing) return VIREO_OK;
-    if(mh && mh->state) {
+    if(vh && vh->state) {
+        rc=vireo_move_reactor_finish_head(s,slot,p); if(rc!=VIREO_OK) return rc;
+    } else if(mh && mh->state) {
         rc=vireo_mkdir_reactor_finish_head(s,slot,p); if(rc!=VIREO_OK) return rc;
     } else if(lh && lh->state) {
         rc=vireo_list_reactor_finish_head(s,slot,p); if(rc!=VIREO_OK) return rc;
@@ -204,9 +217,12 @@ static vireo_result_t application(vireo_auth_service_t *s,client_slot_t *slot,
                !(s->stat_queue && view.header.command==VIREO_COMMAND_NODE_STAT) &&
                !(s->root_queue && view.header.command==VIREO_COMMAND_NODE_ROOT) &&
                !(s->list && view.header.command==VIREO_COMMAND_NODE_LIST) &&
-               !(s->mkdir && view.header.command==VIREO_COMMAND_NODE_MKDIR))
+               !(s->mkdir && view.header.command==VIREO_COMMAND_NODE_MKDIR) &&
+               !(s->move && view.header.command==VIREO_COMMAND_NODE_MOVE))
                 return VIREO_RESULT_PROTOCOL;
-            if(view.header.command==VIREO_COMMAND_NODE_MKDIR) {
+            if(view.header.command==VIREO_COMMAND_NODE_MOVE) {
+                rc=vireo_move_reactor_head(s,slot,view,p); if(rc!=VIREO_OK) return rc;
+            } else if(view.header.command==VIREO_COMMAND_NODE_MKDIR) {
                 rc=vireo_mkdir_reactor_head(s,slot,view,p); if(rc!=VIREO_OK) return rc;
             } else if(view.header.command==VIREO_COMMAND_NODE_LIST) {
                 rc=vireo_list_reactor_head(s,slot,view,p); if(rc!=VIREO_OK) return rc;
@@ -280,18 +296,18 @@ activity:
     }
     rc=vireo_tcp_server_client_tls_flow_refresh(s->r.server,slot->client,&sync,NULL); if(rc!=VIREO_OK) return rc;
     rc=vireo_tls_connection_io_inspect(tls,&io,NULL); if(rc!=VIREO_OK) return rc;
-    if((slot->head.state!=VIREO_AUTH_REQUEST_HEAD_EMPTY || slot->stat_head.state || slot->root_head.state || (lh && lh->state) || (mh && mh->state)) &&
+    if((slot->head.state!=VIREO_AUTH_REQUEST_HEAD_EMPTY || slot->stat_head.state || slot->root_head.state || (lh && lh->state) || (mh && mh->state) || (vh && vh->state)) &&
        io.write_size<=io.options.write_capacity-32)
         return vireo_tcp_server_schedule_client(s->r.server,slot->client,NULL);
     /* 仅完整帧安排业务续处理；半帧绝不因read_size非零忙排队。 */
-    if(!s->quiescing && slot->head.state==VIREO_AUTH_REQUEST_HEAD_EMPTY && !slot->stat_head.state && !slot->root_head.state && (!lh || !lh->state) && (!mh || !mh->state) && io.read_size) {
+    if(!s->quiescing && slot->head.state==VIREO_AUTH_REQUEST_HEAD_EMPTY && !slot->stat_head.state && !slot->root_head.state && (!lh || !lh->state) && (!mh || !mh->state) && (!vh || !vh->state) && io.read_size) {
         vireo_connection_frame_view_t next;
         vireo_connection_frame_info_t frames;
         rc=peek_frame(s,slot,&next,&frames);
         if(rc!=VIREO_OK) return rc;
         if(frames.frame_count) return vireo_tcp_server_schedule_client(s->r.server,slot->client,NULL);
     }
-    if(io.read_eof && !io.read_size && !io.write_size && slot->head.state==VIREO_AUTH_REQUEST_HEAD_EMPTY && !slot->stat_head.state && !slot->root_head.state && (!lh || !lh->state) && (!mh || !mh->state)) {
+    if(io.read_eof && !io.read_size && !io.write_size && slot->head.state==VIREO_AUTH_REQUEST_HEAD_EMPTY && !slot->stat_head.state && !slot->root_head.state && (!lh || !lh->state) && (!mh || !mh->state) && (!vh || !vh->state)) {
         size_t count=0;
         rc=vireo_inflight_store_count_client(s->r.store,slot->client,&count,NULL); if(rc!=VIREO_OK) return rc;
         bool pending=false; vireo_completion_info_t info;
@@ -313,6 +329,10 @@ activity:
         }
         if(s->mkdir && s->mkdir->completion) {
             rc=vireo_completion_inspect(s->mkdir->completion,&info); if(rc!=VIREO_OK) return rc;
+            pending=pending || same(client_of(info.metadata.request),slot->client);
+        }
+        if(s->move && s->move->completion) {
+            rc=vireo_completion_inspect(s->move->completion,&info); if(rc!=VIREO_OK) return rc;
             pending=pending || same(client_of(info.metadata.request),slot->client);
         }
         if(!count && !pending) vireo_auth_service_close_slot(s,slot);
@@ -403,11 +423,11 @@ static vireo_result_t completions(vireo_auth_service_t *s,vireo_auth_service_rep
     vireo_result_t rc=vireo_notifier_consume(s->r.notifier,&hints,NULL); if(rc!=VIREO_OK) return rc;
     if(!s->stat_queue) return auth_completions(s,p);
     if(s->root_queue) {
-        unsigned const queues=s->mkdir?5u:s->list?4u:3u;
+        unsigned const queues=s->move?6u:s->mkdir?5u:s->list?4u:3u;
         unsigned const first=s->completion_cursor; s->completion_cursor=(first+1u)%queues;
         for(unsigned i=0;i<queues;++i) {
             unsigned const q=(first+i)%queues;
-            rc=q==0?auth_completions(s,p):q==1?vireo_stat_reactor_completions(s,p):q==2?vireo_root_reactor_completions(s,p):q==3?vireo_list_reactor_completions(s,p):vireo_mkdir_reactor_completions(s,p);
+            rc=q==0?auth_completions(s,p):q==1?vireo_stat_reactor_completions(s,p):q==2?vireo_root_reactor_completions(s,p):q==3?vireo_list_reactor_completions(s,p):q==4?vireo_mkdir_reactor_completions(s,p):vireo_move_reactor_completions(s,p);
             if(rc!=VIREO_OK) return rc;
         }
         return VIREO_OK;
@@ -421,7 +441,8 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
     vireo_auth_service_options_t const *options,vireo_completion_queue_t *stat_queue,uint32_t stat_operation,
     vireo_completion_queue_t *root_queue,uint32_t root_operation,
     vireo_completion_queue_t *list_queue,uint32_t list_operation,size_t list_bytes,
-    vireo_completion_queue_t *mkdir_queue,uint32_t mkdir_operation,vireo_auth_service_t **owner)
+    vireo_completion_queue_t *mkdir_queue,uint32_t mkdir_operation,
+    vireo_completion_queue_t *move_queue,uint32_t move_operation,vireo_auth_service_t **owner)
 {
     int const saved=errno;
     if(!resources || !options || !owner || *owner) return done(VIREO_RESULT_INVALID_ARGUMENT,saved);
@@ -450,6 +471,11 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
         mkdir_queue==root_queue || mkdir_queue==list_queue || mkdir_operation==stat_operation || mkdir_operation==root_operation ||
         mkdir_operation==list_operation || mkdir_operation==o.register_operation || mkdir_operation==o.login_operation ||
         mkdir_operation==o.logout_operation || mkdir_operation==o.resume_operation)) return done(VIREO_RESULT_INVALID_ARGUMENT,saved);
+    if(move_queue && (!mkdir_queue || !move_operation || move_queue==r.queue || move_queue==stat_queue ||
+       move_queue==root_queue || move_queue==list_queue || move_queue==mkdir_queue ||
+       move_operation==stat_operation || move_operation==root_operation || move_operation==list_operation ||
+       move_operation==mkdir_operation || move_operation==o.register_operation || move_operation==o.login_operation ||
+       move_operation==o.logout_operation || move_operation==o.resume_operation)) return done(VIREO_RESULT_INVALID_ARGUMENT,saved);
     if(list_queue && (list_bytes<VIREO_DIRECTORY_LIST_COMPLETION_PAYLOAD_MAX || list_bytes>MEMORY_MAX)) return done(VIREO_RESULT_RANGE,saved);
     vireo_tcp_server_info_t root; vireo_tcp_server_tls_info_t tls;
     vireo_inflight_store_info_t inflight; vireo_thread_pool_info_t workers; vireo_completion_queue_info_t queue;
@@ -486,6 +512,13 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
         if(!q.wait_prepared) return done(VIREO_RESULT_NOT_FOUND,saved);
         if(q.count) return done(VIREO_RESULT_BUSY,saved);
     }
+    if(move_queue) {
+        vireo_completion_queue_info_t q;
+        rc=vireo_completion_queue_inspect(move_queue,&q); if(rc!=VIREO_OK) return done(rc,saved);
+        if(q.closed) return done(VIREO_RESULT_CANCELLED,saved);
+        if(!q.wait_prepared) return done(VIREO_RESULT_NOT_FOUND,saved);
+        if(q.count) return done(VIREO_RESULT_BUSY,saved);
+    }
     if(root.stop_requested || workers.stop_requested || queue.closed) return done(VIREO_RESULT_CANCELLED,saved);
     if(!root.listener_owned || !root.listener_bound || !queue.wait_prepared) return done(VIREO_RESULT_NOT_FOUND,saved);
     if(root.connection_count || inflight.count || !workers.execution_enabled || !workers.configured ||
@@ -494,9 +527,9 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
     if(o.max_clients>root.connection_capacity || o.admit.max_accepts>root.connection_capacity ||
        o.max_completions>65536 || o.cleanup_slots>65536 || o.max_client_requests>inflight.capacity ||
        o.task_allocation_budget>MEMORY_MAX || o.max_memory_bytes>MEMORY_MAX ||
-       tls.options.io.read_capacity<(mkdir_queue?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX) ||
-       tls.options.io.max_read_unit_bytes<(mkdir_queue?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX) ||
-       (mkdir_queue && tls.options.io.read_low<VIREO_NODE_MKDIR_REQUEST_FRAME_MAX-1) || tls.options.io.write_capacity<(list_queue?VIREO_NODE_LIST_RESPONSE_FRAME_MAX:stat_queue?VIREO_NODE_STAT_RESPONSE_FRAME_MAX:104) ||
+       tls.options.io.read_capacity<(move_queue?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:mkdir_queue?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX) ||
+       tls.options.io.max_read_unit_bytes<(move_queue?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:mkdir_queue?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX) ||
+       (mkdir_queue && tls.options.io.read_low<(move_queue?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:VIREO_NODE_MKDIR_REQUEST_FRAME_MAX)-1) || tls.options.io.write_capacity<(list_queue?VIREO_NODE_LIST_RESPONSE_FRAME_MAX:stat_queue?VIREO_NODE_STAT_RESPONSE_FRAME_MAX:104) ||
        o.receive.max_bytes<min_size(tls.options.io.read_capacity,VIREO_TLS_IO_SCRATCH_BYTES) ||
        o.send.max_bytes<min_size(tls.options.io.write_capacity,VIREO_TLS_IO_SCRATCH_BYTES)) return done(VIREO_RESULT_RANGE,saved);
     size_t slots_bytes=0,ready_bytes=0,accepted_bytes=0,total=sizeof(vireo_auth_service_t);
@@ -509,7 +542,7 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
     if(rc!=VIREO_OK) return done(rc,saved);
     size_t expected_capacity=0,expected_bytes=0;
     if(stat_queue) {
-        if(rc==VIREO_OK) rc=vireo_checked_size_add(inflight.capacity,mkdir_queue?5:list_queue?4:root_queue?3:2,&expected_capacity);
+        if(rc==VIREO_OK) rc=vireo_checked_size_add(inflight.capacity,move_queue?6:mkdir_queue?5:list_queue?4:root_queue?3:2,&expected_capacity);
         if(rc==VIREO_OK) rc=vireo_checked_size_mul(expected_capacity,sizeof(vireo_stat_expected_t),&expected_bytes);
         if(rc==VIREO_OK) rc=vireo_checked_size_add(total,expected_bytes,&total);
         if(rc!=VIREO_OK) return done(rc,saved);
@@ -530,6 +563,15 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
         if(rc==VIREO_OK) rc=vireo_checked_size_add(total,sizeof(vireo_mkdir_reactor_state_t),&total);
         if(rc==VIREO_OK) rc=vireo_checked_size_add(total,mkdir_heads_bytes,&total);
         if(rc==VIREO_OK) rc=vireo_checked_size_add(total,mkdir_requests_bytes,&total);
+        if(rc!=VIREO_OK) return done(rc,saved);
+    }
+    size_t move_heads_bytes=0,move_requests_bytes=0;
+    if(move_queue) {
+        rc=vireo_checked_size_mul(root.connection_capacity,sizeof(vireo_move_head_t),&move_heads_bytes);
+        if(rc==VIREO_OK) rc=vireo_checked_size_mul(expected_capacity,sizeof(vireo_move_request_key_t),&move_requests_bytes);
+        if(rc==VIREO_OK) rc=vireo_checked_size_add(total,sizeof(vireo_move_reactor_state_t),&total);
+        if(rc==VIREO_OK) rc=vireo_checked_size_add(total,move_heads_bytes,&total);
+        if(rc==VIREO_OK) rc=vireo_checked_size_add(total,move_requests_bytes,&total);
         if(rc!=VIREO_OK) return done(rc,saved);
     }
     if(total>o.max_memory_bytes) return done(VIREO_RESULT_RANGE,saved);
@@ -564,9 +606,18 @@ static vireo_result_t create(vireo_auth_service_resources_t const *resources,
         s->mkdir->queue=mkdir_queue; s->mkdir->operation=mkdir_operation;
         vireo_mkdir_reactor_default_ops(&s->mkdir->ops);
     }
+    if(move_queue) {
+        s->move=calloc(1,sizeof(*s->move));
+        if(!s->move) { rc=VIREO_RESULT_NO_MEMORY; goto fail; }
+        s->move->heads=calloc(1,move_heads_bytes); s->move->requests=calloc(1,move_requests_bytes);
+        if(!s->move->heads || !s->move->requests) { rc=VIREO_RESULT_NO_MEMORY; goto fail; }
+        s->move->queue=move_queue; s->move->operation=move_operation;
+        vireo_move_reactor_default_ops(&s->move->ops);
+    }
     rc=vireo_notifier_server_register(r.server,r.notifier,&s->handle,NULL); if(rc!=VIREO_OK) goto fail;
     *owner=s; return done(VIREO_OK,saved);
 fail:
+    if(s->move) { free(s->move->requests); free(s->move->heads); free(s->move); }
     if(s->mkdir) { free(s->mkdir->requests); free(s->mkdir->heads); free(s->mkdir); }
     if(s->list) { free(s->list->requests); free(s->list->heads); free(s->list); }
     free(s->expected); free(s->accepted); free(s->ready); free(s->slots); free(s); return done(rc,saved);
@@ -574,24 +625,37 @@ fail:
 
 vireo_result_t vireo_auth_service_create(vireo_auth_service_resources_t const *r,
     vireo_auth_service_options_t const *o,vireo_auth_service_t **owner)
-{ return create(r,o,NULL,0,NULL,0,NULL,0,0,NULL,0,owner); }
+{ return create(r,o,NULL,0,NULL,0,NULL,0,0,NULL,0,NULL,0,owner); }
 vireo_result_t vireo_directory_stat_reactor_create(vireo_auth_service_resources_t const *r,
     vireo_auth_service_options_t const *o,vireo_completion_queue_t *queue,uint32_t operation,vireo_auth_service_t **owner)
-{ return queue?create(r,o,queue,operation,NULL,0,NULL,0,0,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+{ return queue?create(r,o,queue,operation,NULL,0,NULL,0,0,NULL,0,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
 vireo_result_t vireo_directory_root_reactor_create(vireo_auth_service_resources_t const *r,
     vireo_auth_service_options_t const *o,vireo_completion_queue_t *sq,uint32_t sop,
     vireo_completion_queue_t *rq,uint32_t rop,vireo_auth_service_t **owner)
-{ return sq && rq?create(r,o,sq,sop,rq,rop,NULL,0,0,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+{ return sq && rq?create(r,o,sq,sop,rq,rop,NULL,0,0,NULL,0,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
 vireo_result_t vireo_directory_list_reactor_create(vireo_auth_service_resources_t const *r,
     vireo_auth_service_options_t const *o,vireo_completion_queue_t *sq,uint32_t sop,
     vireo_completion_queue_t *rq,uint32_t rop,vireo_completion_queue_t *lq,uint32_t lop,
     size_t bytes,vireo_auth_service_t **owner)
-{ return sq && rq && lq?create(r,o,sq,sop,rq,rop,lq,lop,bytes,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+{ return sq && rq && lq?create(r,o,sq,sop,rq,rop,lq,lop,bytes,NULL,0,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
 vireo_result_t vireo_directory_mkdir_reactor_create(vireo_auth_service_resources_t const *r,
     vireo_auth_service_options_t const *o,vireo_completion_queue_t *sq,uint32_t sop,
     vireo_completion_queue_t *rq,uint32_t rop,vireo_completion_queue_t *lq,uint32_t lop,
     size_t bytes,vireo_completion_queue_t *mq,uint32_t mop,vireo_auth_service_t **owner)
-{ return sq && rq && lq && mq?create(r,o,sq,sop,rq,rop,lq,lop,bytes,mq,mop,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+{ return sq && rq && lq && mq?create(r,o,sq,sop,rq,rop,lq,lop,bytes,mq,mop,NULL,0,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+vireo_result_t vireo_directory_move_reactor_create(vireo_auth_service_resources_t const *r,
+    vireo_auth_service_options_t const *o,vireo_completion_queue_t *sq,uint32_t sop,
+    vireo_completion_queue_t *rq,uint32_t rop,vireo_completion_queue_t *lq,uint32_t lop,
+    size_t bytes,vireo_completion_queue_t *mq,uint32_t mop,vireo_completion_queue_t *vq,uint32_t vop,
+    vireo_auth_service_t **owner)
+{ return sq && rq && lq && mq && vq?create(r,o,sq,sop,rq,rop,lq,lop,bytes,mq,mop,vq,vop,owner):VIREO_RESULT_INVALID_ARGUMENT; }
+vireo_result_t vireo_directory_move_reactor_inspect(vireo_auth_service_t const *s,vireo_directory_move_reactor_report_t *out)
+{
+    int const saved=errno;
+    if(!s || !out) return done(VIREO_RESULT_INVALID_ARGUMENT,saved);
+    if(!s->move) return done(VIREO_RESULT_NOT_FOUND,saved);
+    *out=s->move->report; return done(VIREO_OK,saved);
+}
 vireo_result_t vireo_directory_mkdir_reactor_inspect(vireo_auth_service_t const *s,vireo_directory_mkdir_reactor_report_t *out)
 {
     int const saved=errno;
@@ -625,6 +689,7 @@ vireo_result_t vireo_auth_service_once(vireo_auth_service_t *s,int timeout,vireo
     int const saved=errno; vireo_auth_service_report_t p={0}; vireo_result_t rc=VIREO_OK;
     if(!s || !out || timeout<0) { rc=VIREO_RESULT_INVALID_ARGUMENT; goto finish; }
     if(timeout>1000) { rc=VIREO_RESULT_RANGE; goto finish; }
+    if(s->move) s->move->report=(vireo_directory_move_reactor_report_t){0};
     if(s->mkdir) s->mkdir->report=(vireo_directory_mkdir_reactor_report_t){0};
     if(s->list) s->list->report=(vireo_directory_list_reactor_report_t){0};
     s->root_report=(vireo_directory_root_reactor_report_t){0};
@@ -703,6 +768,7 @@ post:
 finish:
     if(s) {
         p.quiescing=s->quiescing;
+        if(s->move) { s->move->report.completion_pending=s->move->completion!=NULL; s->move->report.expected_requests=s->expected_count; }
         if(s->mkdir) { s->mkdir->report.completion_pending=s->mkdir->completion!=NULL; s->mkdir->report.expected_requests=s->expected_count; }
         if(s->list) { s->list->report.completion_pending=s->list->completion!=NULL; s->list->report.expected_requests=s->expected_count; }
         s->root_report.completion_pending=s->root_completion!=NULL;
@@ -726,7 +792,7 @@ vireo_result_t vireo_auth_service_destroy(vireo_auth_service_t **owner)
     int const saved=errno;
     if(!owner) return done(VIREO_RESULT_INVALID_ARGUMENT,saved);
     vireo_auth_service_t *s=*owner; if(!s) return done(VIREO_OK,saved);
-    if(s->active || s->completion || s->receipt.state || s->stat_completion || s->stat_receipt.state || s->root_completion || s->root_receipt.state || (s->list && (s->list->completion || s->list->receipt.state)) || (s->mkdir && (s->mkdir->completion || s->mkdir->receipt.state)) || s->expected_count || s->ready_next<s->ready_count) return done(VIREO_RESULT_BUSY,saved);
+    if(s->active || s->completion || s->receipt.state || s->stat_completion || s->stat_receipt.state || s->root_completion || s->root_receipt.state || (s->list && (s->list->completion || s->list->receipt.state)) || (s->mkdir && (s->mkdir->completion || s->mkdir->receipt.state)) || (s->move && (s->move->completion || s->move->receipt.state)) || s->expected_count || s->ready_next<s->ready_count) return done(VIREO_RESULT_BUSY,saved);
     vireo_result_t rc=vireo_notifier_server_unregister(s->r.server,&s->handle,NULL); if(rc!=VIREO_OK) return done(rc,saved);
     if(s->list) {
         (void)vireo_secure_clear(s->list->requests,s->expected_capacity*sizeof(*s->list->requests));
@@ -739,6 +805,12 @@ vireo_result_t vireo_auth_service_destroy(vireo_auth_service_t **owner)
         (void)vireo_secure_clear(s->mkdir->heads,s->capacity*sizeof(*s->mkdir->heads));
         free(s->mkdir->requests); free(s->mkdir->heads);
         (void)vireo_secure_clear(s->mkdir,sizeof(*s->mkdir)); free(s->mkdir);
+    }
+    if(s->move) {
+        (void)vireo_secure_clear(s->move->requests,s->expected_capacity*sizeof(*s->move->requests));
+        (void)vireo_secure_clear(s->move->heads,s->capacity*sizeof(*s->move->heads));
+        free(s->move->requests); free(s->move->heads);
+        (void)vireo_secure_clear(s->move,sizeof(*s->move)); free(s->move);
     }
     free(s->deadline_routes); free(s->expected); free(s->accepted); free(s->ready); free(s->slots); free(s); *owner=NULL;
     return done(VIREO_OK,saved);

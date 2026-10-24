@@ -1416,9 +1416,14 @@ int main(void) { return strcmp(utf8proc_version(), \"2.9.0\") || strcmp(utf8proc
     vireo_target_enable_warnings(vireo_directory_mkdir_worker_runtime)
     vireo_target_enable_sanitizers(vireo_directory_mkdir_worker_runtime)
 
-    add_library(vireo_auth_service_loop STATIC src/net/auth_service.c src/net/auth_service_deadline.c src/net/directory_stat_reactor.c src/net/directory_root_reactor.c src/net/directory_list_reactor.c src/net/directory_mkdir_reactor.c)
+    add_library(vireo_directory_move_worker_runtime STATIC src/app/directory_move_worker_runtime.c)
+    target_link_libraries(vireo_directory_move_worker_runtime PUBLIC vireo_directory_mkdir_worker_runtime vireo_directory_move_worker)
+    vireo_target_enable_warnings(vireo_directory_move_worker_runtime)
+    vireo_target_enable_sanitizers(vireo_directory_move_worker_runtime)
+
+    add_library(vireo_auth_service_loop STATIC src/net/auth_service.c src/net/auth_service_deadline.c src/net/directory_stat_reactor.c src/net/directory_root_reactor.c src/net/directory_list_reactor.c src/net/directory_mkdir_reactor.c src/net/directory_move_reactor.c)
     target_link_libraries(vireo_auth_service_loop PUBLIC vireo_auth_request_rejection
-        vireo_auth_response_consumer vireo_notifier_server vireo_inflight vireo_directory_stat_completion vireo_directory_root_completion vireo_directory_list_completion vireo_directory_mkdir_completion
+        vireo_auth_response_consumer vireo_notifier_server vireo_inflight vireo_directory_stat_completion vireo_directory_root_completion vireo_directory_list_completion vireo_directory_mkdir_completion vireo_directory_move_completion
         PUBLIC vireo_timer_wheel PRIVATE vireo_checked vireo_clock vireo_client_deadline vireo_timer_loop)
     vireo_target_enable_warnings(vireo_auth_service_loop)
     vireo_target_enable_sanitizers(vireo_auth_service_loop)
@@ -1436,7 +1441,7 @@ int main(void) { return strcmp(utf8proc_version(), \"2.9.0\") || strcmp(utf8proc
     vireo_target_enable_sanitizers(vireo_mysql_schema)
     # 应用私有的完整进程与最小CLI，不安装私有头。
     add_library(vireo_auth_process STATIC src/app/auth_process.c src/app/auth_failure_writer.c)
-    target_link_libraries(vireo_auth_process PUBLIC vireo_directory_mkdir_worker_runtime vireo_auth_service_loop
+    target_link_libraries(vireo_auth_process PUBLIC vireo_directory_move_worker_runtime vireo_auth_service_loop
         vireo_mysql_schema PRIVATE vireo_secure_clear Threads::Threads OpenSSL::Crypto)
     vireo_target_enable_warnings(vireo_auth_process)
     vireo_target_enable_sanitizers(vireo_auth_process)
@@ -1517,6 +1522,35 @@ int main(void) { return strcmp(utf8proc_version(), \"2.9.0\") || strcmp(utf8proc
         vireo_target_enable_sanitizers(vireo_directory_mkdir_reactor_test)
         add_test(NAME vireo_directory_mkdir_reactor_test COMMAND vireo_directory_mkdir_reactor_test)
         set_tests_properties(vireo_directory_mkdir_reactor_test PROPERTIES TIMEOUT 90)
+
+        add_executable(vireo_directory_move_process_real_test tests/app/test_directory_move_process_real.c)
+        target_include_directories(vireo_directory_move_process_real_test PRIVATE src/app)
+        target_compile_definitions(vireo_directory_move_process_real_test PRIVATE
+            VIREO_AUTH_PROCESS_TEST_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/app/test_directory_move_process.py")
+        target_link_libraries(vireo_directory_move_process_real_test PRIVATE vireo_auth_process)
+        target_link_options(vireo_directory_move_process_real_test PRIVATE -Wl,--wrap=vireo_clock_monotonic_now -Wl,--wrap=vireo_directory_move_completion_publish)
+        add_dependencies(vireo_directory_move_process_real_test vireo-auth-server)
+        vireo_target_enable_warnings(vireo_directory_move_process_real_test)
+        vireo_target_enable_sanitizers(vireo_directory_move_process_real_test)
+        add_test(NAME vireo_directory_move_process_real_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_directory_move_process_real_test> schema)
+        set_tests_properties(vireo_directory_move_process_real_test PROPERTIES TIMEOUT 330)
+
+        add_executable(vireo_directory_move_worker_runtime_test tests/app/test_directory_move_worker_runtime.c)
+        target_include_directories(vireo_directory_move_worker_runtime_test PRIVATE src/app tests/service)
+        target_link_libraries(vireo_directory_move_worker_runtime_test PRIVATE vireo_auth_process vireo_directory_move_worker_runtime vireo_protocol_codec vireo_thread_pool)
+        vireo_target_enable_warnings(vireo_directory_move_worker_runtime_test)
+        vireo_target_enable_sanitizers(vireo_directory_move_worker_runtime_test)
+        add_test(NAME vireo_directory_move_worker_runtime_test COMMAND vireo_directory_move_worker_runtime_test)
+        set_tests_properties(vireo_directory_move_worker_runtime_test PROPERTIES TIMEOUT 60)
+        add_executable(vireo_directory_move_reactor_test tests/net/test_directory_move_reactor.c)
+        target_include_directories(vireo_directory_move_reactor_test PRIVATE src/net tests/net)
+        target_link_libraries(vireo_directory_move_reactor_test PRIVATE vireo_auth_service_loop vireo_auth_task_context)
+        target_link_options(vireo_directory_move_reactor_test PRIVATE -Wl,--wrap=calloc)
+        vireo_target_enable_warnings(vireo_directory_move_reactor_test)
+        vireo_target_enable_sanitizers(vireo_directory_move_reactor_test)
+        add_test(NAME vireo_directory_move_reactor_test COMMAND vireo_directory_move_reactor_test)
+        set_tests_properties(vireo_directory_move_reactor_test PROPERTIES TIMEOUT 90)
 
         add_executable(vireo_directory_list_worker_runtime_test tests/app/test_directory_list_worker_runtime.c)
         target_include_directories(vireo_directory_list_worker_runtime_test PRIVATE src/app tests/service)
