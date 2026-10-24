@@ -1,5 +1,5 @@
 /* PROJECT : VIREO; FILE : directory_name.h; AUTHOR : bitofux;
- * DATE : 2026-10-23; BRIEF : 新目录名单段UTF-8/NAME/NFC校验。 */
+ * DATE : 2026-10-23; BRIEF : 新节点名单段UTF-8/NAME/NFC校验。 */
 #ifndef VIREO_SERVICE_DIRECTORY_NAME_H
 #define VIREO_SERVICE_DIRECTORY_NAME_H
 #include <stddef.h>
@@ -18,7 +18,7 @@ typedef enum vireo_directory_name_issue {
 } vireo_directory_name_issue_t;
 
 /**
- * @brief 检查新目录名已经是NFC，不修改、返回或保存规范化后的名字
+ * @brief 检查新节点名已经是NFC，不修改、返回或保存规范化后的名字
  *
  * @param[in] name
  *     必需稳定只读name_length字节，无尾NUL要求；仅借至返回。
