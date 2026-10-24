@@ -992,6 +992,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME vireo_mysql_node_mkdir_once_real_test COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_mysql_node_mkdir_once_real_test> schema)
         set_tests_properties(vireo_mysql_node_mkdir_once_real_test PROPERTIES TIMEOUT 330)
+        add_executable(vireo_mysql_node_move_once_test tests/persistence/test_mysql_node_move_once.c)
+        target_include_directories(vireo_mysql_node_move_once_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/persistence)
+        target_link_libraries(vireo_mysql_node_move_once_test PRIVATE vireo_mysql_node_repository Threads::Threads)
+        vireo_target_enable_warnings(vireo_mysql_node_move_once_test)
+        vireo_target_enable_sanitizers(vireo_mysql_node_move_once_test)
+        add_test(NAME vireo_mysql_node_move_once_test COMMAND vireo_mysql_node_move_once_test)
+        set_tests_properties(vireo_mysql_node_move_once_test PROPERTIES TIMEOUT 30)
+        add_executable(vireo_mysql_node_move_once_real_test tests/persistence/test_mysql_node_move_once_real.c)
+        target_include_directories(vireo_mysql_node_move_once_real_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/persistence)
+        target_link_libraries(vireo_mysql_node_move_once_real_test PRIVATE vireo_mysql_node_repository vireo_mysql_user_repository vireo_mysql_schema Threads::Threads)
+        vireo_target_enable_warnings(vireo_mysql_node_move_once_real_test)
+        vireo_target_enable_sanitizers(vireo_mysql_node_move_once_real_test)
+        add_test(NAME vireo_mysql_node_move_once_real_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_mysql_node_move_once_real_test> schema)
+        set_tests_properties(vireo_mysql_node_move_once_real_test PROPERTIES TIMEOUT 330)
         add_executable(vireo_mysql_node_move_test tests/persistence/test_mysql_node_move.c)
         target_include_directories(vireo_mysql_node_move_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/persistence)
         target_link_libraries(vireo_mysql_node_move_test PRIVATE vireo_mysql_node_repository Threads::Threads)
@@ -1662,7 +1677,7 @@ int main(void) { return strcmp(utf8proc_version(), \"2.9.0\") || strcmp(utf8proc
         add_test(NAME vireo_auth_username_repository_real_test COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_auth_username_repository_real_test> schema)
         set_tests_properties(vireo_auth_username_repository_real_test PROPERTIES TIMEOUT 330)
-        foreach(schema_case IN ITEMS mysql_schema mysql_schema_real mysql_schema_nodes mysql_schema_nodes_real mysql_schema_audit mysql_schema_audit_real mysql_schema_upload mysql_schema_upload_real mysql_schema_manifest mysql_schema_manifest_real mysql_schema_replica mysql_schema_replica_real mysql_schema_download mysql_schema_download_real mysql_schema_gc mysql_schema_gc_real mysql_schema_directory_receipts mysql_schema_directory_receipts_real)
+        foreach(schema_case IN ITEMS mysql_schema mysql_schema_real mysql_schema_nodes mysql_schema_nodes_real mysql_schema_audit mysql_schema_audit_real mysql_schema_upload mysql_schema_upload_real mysql_schema_manifest mysql_schema_manifest_real mysql_schema_replica mysql_schema_replica_real mysql_schema_download mysql_schema_download_real mysql_schema_gc mysql_schema_gc_real mysql_schema_directory_receipts mysql_schema_directory_receipts_real mysql_schema_move_receipts mysql_schema_move_receipts_real)
             add_executable(vireo_${schema_case}_test tests/persistence/test_${schema_case}.c)
             target_link_libraries(vireo_${schema_case}_test PRIVATE vireo_mysql_schema vireo_password vireo_session_token OpenSSL::Crypto)
             vireo_target_enable_warnings(vireo_${schema_case}_test)
@@ -1709,6 +1724,11 @@ int main(void) { return strcmp(utf8proc_version(), \"2.9.0\") || strcmp(utf8proc
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_mysql_schema_gc_real_test> gc)
         set_tests_properties(vireo_mysql_schema_gc_real_test PROPERTIES TIMEOUT 330)
 
+        add_test(NAME vireo_mysql_schema_move_receipts_test COMMAND vireo_mysql_schema_move_receipts_test)
+        set_tests_properties(vireo_mysql_schema_move_receipts_test PROPERTIES TIMEOUT 30)
+        add_test(NAME vireo_mysql_schema_move_receipts_real_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/persistence/run_mysql_fixture.py $<TARGET_FILE:vireo_mysql_schema_move_receipts_real_test> move_receipts)
+        set_tests_properties(vireo_mysql_schema_move_receipts_real_test PROPERTIES TIMEOUT 330)
         add_test(NAME vireo_mysql_schema_directory_receipts_test COMMAND vireo_mysql_schema_directory_receipts_test)
         set_tests_properties(vireo_mysql_schema_directory_receipts_test PROPERTIES TIMEOUT 30)
         add_test(NAME vireo_mysql_schema_directory_receipts_real_test COMMAND ${Python3_EXECUTABLE}

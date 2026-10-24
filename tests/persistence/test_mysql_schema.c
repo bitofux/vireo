@@ -30,7 +30,7 @@ int main(void)
     assert(vireo_mysql_schema_catalog(&m,NULL)==VIREO_RESULT_INVALID_ARGUMENT && m==&sentinel);
     assert(errno==EDOM);
     assert(vireo_mysql_schema_catalog(&m,&count)==VIREO_OK && errno==EDOM);
-    assert(count==9 && m->version==1 && m->step_count==2 && m->steps);
+    assert(count==10 && m->version==1 && m->step_count==2 && m->steps);
     const vireo_mysql_migration_t *again=NULL; size_t second=0;
     assert(vireo_mysql_schema_catalog(&again,&second)==VIREO_OK && again==m && second==count && errno==EDOM);
     assert(count<=VIREO_MYSQL_MIGRATIONS_MAX && m->step_count<=VIREO_MYSQL_MIGRATION_STEPS_MAX);

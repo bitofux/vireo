@@ -82,8 +82,13 @@ def main():
         configured = True
         sql("CREATE DATABASE vireo_connection_test CHARACTER SET utf8mb4;"
             "CREATE USER 'vireo_test'@'localhost' IDENTIFIED BY '" + password + "';"
-            "GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX ON vireo_connection_test.* "
+            "GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX,ALTER ON vireo_connection_test.* "
             "TO 'vireo_test'@'localhost';", authenticated=True)
+        if len(sys.argv) > 2 and sys.argv[2] == "move_receipts":
+            sql("GRANT REFERENCES ON vireo_connection_test.* TO 'vireo_test'@'localhost';"
+                "CREATE DATABASE vireo_move_upgrade CHARACTER SET utf8mb4;"
+                "GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,INDEX,REFERENCES,ALTER ON "
+                "vireo_move_upgrade.* TO 'vireo_test'@'localhost';", authenticated=True)
         if len(sys.argv) > 2 and sys.argv[2] == "schema":
             sql("GRANT REFERENCES ON vireo_connection_test.* TO 'vireo_test'@'localhost';",
                 authenticated=True)

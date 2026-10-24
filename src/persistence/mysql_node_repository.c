@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "mysql_node_repository_internal.h"
 #include <vireo/persistence/mysql_node_mkdir_receipt.h>
+#include <vireo/persistence/mysql_node_move_receipt.h>
 #include <vireo/base/checked.h>
 #include <vireo/persistence/mysql_schema.h>
 #include <errno.h>
@@ -1430,6 +1431,273 @@ done:
         e->stage == STAGE(NAME_CHECK) || e->stage == STAGE(UPDATE) || e->stage == STAGE(AUDIT) ||
         e->stage == STAGE(COMMIT))) { report->issue = VIREO_MYSQL_NODE_UNEXPECTED_RESULT; }
     rc = cleanup_move(r, transaction, rc, report, e);
+    return finish(saved, rc);
+}
+
+/** @brief MOVE回执专用8参数/10列边界，旧MKDIR限额保持。 */
+static vireo_result_t move_receipt_execute(vireo_mysql_node_repository_t *r, const char *sql,
+    const vireo_mysql_parameter_t *p, size_t n, vireo_mysql_node_stage_t stage,
+    vireo_mysql_execution_t *ex, vireo_mysql_node_error_t *e)
+{
+    static const vireo_mysql_statement_limits_t limits = {8, 10, 271, 255, 32768};
+    *ex = (vireo_mysql_execution_t){0};
+    vireo_mysql_error_t db = {0};
+    vireo_result_t rc = r->ops.prepare(r->thread, r->connection, sql, strlen(sql), &limits, &r->statement, &db);
+    if (rc == VIREO_RESULT_RANGE) { rc = VIREO_RESULT_DATABASE; }
+    diagnose(e, stage, rc, &db, NULL, false);
+    if (rc == VIREO_OK) {
+        rc = r->ops.execute(r->thread, r->statement, p, n, ex, &db);
+        if (rc == VIREO_RESULT_RANGE) { rc = VIREO_RESULT_DATABASE; }
+        diagnose(e, stage, rc, &db, NULL, false);
+    }
+    return rc;
+}
+typedef struct move_receipt {
+    uint64_t parent_id, source_id, node_id, audit_id;
+    size_t name_length;
+    unsigned char name[255];
+} move_receipt_t;
+static vireo_result_t lock_move_receipt(vireo_mysql_node_repository_t *r, uint64_t owner,
+    const vireo_mysql_node_move_once_input_t *in, move_receipt_t *value, bool *found,
+    vireo_mysql_node_move_once_report_t *report, vireo_mysql_node_error_t *e)
+{
+    static const char sql[] = "SELECT user_id,command,idempotency_key,format_version,request_parent_id,request_node_id,"
+        "request_name,result_node_id,audit_id,created_at_ms FROM directory_write_receipts "
+        "WHERE user_id=? AND command=1029 AND idempotency_key=? FOR UPDATE";
+    vireo_mysql_parameter_t p[2] = {U64(owner),
+        {.kind=VIREO_MYSQL_PARAMETER_BYTES, .value.span={in->idempotency_key, 16}}};
+    vireo_mysql_execution_t ex; vireo_mysql_error_t db = {0};
+    vireo_result_t rc = move_receipt_execute(r, sql, p, 2, STAGE(RECEIPT_READ), &ex, e);
+    bool malformed = rc == VIREO_OK && !ex.has_result;
+    *found = false;
+    if (malformed) { rc = VIREO_RESULT_DATABASE; }
+    vireo_mysql_fetch_outcome_t outcome;
+    if (rc == VIREO_OK) {
+        rc = r->ops.fetch(r->thread, r->statement, &outcome, &db);
+        if (rc == VIREO_OK && outcome == VIREO_MYSQL_FETCH_ROW) { *found = true; }
+        else if (rc == VIREO_OK && outcome != VIREO_MYSQL_FETCH_DONE) { malformed = true; rc = VIREO_RESULT_DATABASE; }
+    }
+    vireo_mysql_cell_view_t c[10]; uint64_t v[10] = {0};
+    if (rc == VIREO_OK && *found) {
+        for (size_t i = 0; i < 10 && rc == VIREO_OK; ++i) {
+            rc = r->ops.column(r->thread, r->statement, i, c + i);
+        }
+        if (rc == VIREO_OK) {
+            for (size_t i = 0; i < 10; ++i) {
+                if (i != 2 && i != 6 && !number(c + i, v + i)) { malformed = true; }
+            }
+            if (v[0] != owner || v[1] != 1029 || v[3] != 1 || v[4] == 0 || v[5] == 0 || v[7] != v[5] || v[8] == 0 ||
+                c[2].is_null || c[2].data == NULL || c[2].length != 16 ||
+                (c[2].length == 16 && c[2].data != NULL && memcmp(c[2].data, in->idempotency_key, 16) != 0) ||
+                c[6].is_null || c[6].data == NULL || c[6].length == 0 || c[6].length > 255) { malformed = true; }
+            if (!malformed && !receipt_name_valid(c[6].data, c[6].length)) { malformed = true; }
+            if (malformed) { rc = VIREO_RESULT_DATABASE; }
+            else {
+                value->parent_id = v[4]; value->source_id = v[5]; value->node_id = v[7]; value->audit_id = v[8];
+                value->name_length = c[6].length; memcpy(value->name, c[6].data, c[6].length);
+                rc = r->ops.fetch(r->thread, r->statement, &outcome, &db);
+                if (rc == VIREO_OK && outcome != VIREO_MYSQL_FETCH_DONE) { malformed = true; rc = VIREO_RESULT_DATABASE; }
+            }
+        }
+    }
+    if (rc == VIREO_RESULT_RANGE) { malformed = true; rc = VIREO_RESULT_DATABASE; }
+    if (malformed) { report->issue = VIREO_MYSQL_NODE_RECEIPT_INVALID; }
+    diagnose(e, STAGE(RECEIPT_READ), rc, &db, NULL, false);
+    vireo_result_t closed = close_statement(r, e);
+    return rc == VIREO_OK ? closed : rc;
+}
+/** @brief 回执无自增ID；只要求单行DML确认，insert_id不参与解释。 */
+static vireo_result_t insert_move_receipt(vireo_mysql_node_repository_t *r, uint64_t owner,
+    const vireo_mysql_node_move_once_input_t *in, uint64_t node, uint64_t audit,
+    uint64_t now, vireo_mysql_node_error_t *e)
+{
+    static const char sql[] = "INSERT INTO directory_write_receipts(user_id,command,idempotency_key,format_version,"
+        "request_parent_id,request_node_id,request_name,result_node_id,audit_id,created_at_ms) VALUES(?,1029,?,1,?,?,?,?,?,?)";
+    vireo_mysql_parameter_t p[8] = {U64(owner),
+        {.kind=VIREO_MYSQL_PARAMETER_BYTES, .value.span={in->idempotency_key, 16}}, U64(in->new_parent_id), U64(in->node_id),
+        {.kind=VIREO_MYSQL_PARAMETER_BYTES, .value.span={in->name, in->name_length}}, U64(node), U64(audit), U64(now)};
+    vireo_mysql_execution_t ex;
+    vireo_result_t rc = move_receipt_execute(r, sql, p, 8, STAGE(RECEIPT_INSERT), &ex, e);
+    if (rc == VIREO_OK && (ex.has_result || ex.affected_rows != 1)) { rc = VIREO_RESULT_DATABASE; }
+    diagnose(e, STAGE(RECEIPT_INSERT), rc, NULL, NULL, false);
+    vireo_result_t closed = close_statement(r, e);
+    return rc == VIREO_OK ? closed : rc;
+}
+
+/** @brief MOVE回执清理独立保留effect；UNKNOWN只丢弃，残留owner必须继续销毁。 */
+static vireo_result_t cleanup_move_once(vireo_mysql_node_repository_t *r, bool transaction,
+    vireo_result_t rc, vireo_mysql_node_move_once_report_t *report, vireo_mysql_node_error_t *e)
+{
+    vireo_result_t next = close_statement(r, e);
+    if (rc == VIREO_OK) { rc = next; }
+    if (transaction && report->commit == VIREO_MYSQL_NODE_MOVE_NOT_COMMITTED &&
+        r->statement == NULL && r->connection != NULL) {
+        vireo_mysql_execution_t ex; bool replied;
+        next = write_command(r, "ROLLBACK", NULL, 0, STAGE(ROLLBACK), false, true, &ex, &replied, e);
+        report->rollback_confirmed = replied;
+        if (rc == VIREO_OK) { rc = next; }
+    }
+    if (r->statement == NULL && r->lease.owner != NULL) {
+        bool ended = report->commit == VIREO_MYSQL_NODE_MOVE_COMMITTED || report->rollback_confirmed;
+        bool healthy = ended && e->cleanup_result == VIREO_OK &&
+            (rc == VIREO_OK || rc == VIREO_RESULT_NOT_FOUND || (report->issue == VIREO_MYSQL_NODE_NAME_CONFLICT || report->issue == VIREO_MYSQL_NODE_ROOT_IMMOVABLE ||
+             report->issue == VIREO_MYSQL_NODE_MOVE_CYCLE || report->issue == VIREO_MYSQL_NODE_TREE_INVALID ||
+             report->issue == VIREO_MYSQL_NODE_ANCESTRY_LIMIT || report->issue == VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT));
+        vireo_mysql_pool_release_t released = {0}; vireo_mysql_pool_error_t pe = {0};
+        next = r->ops.release(r->thread, r->pool, &r->lease,
+            healthy ? VIREO_MYSQL_POOL_RECYCLE : VIREO_MYSQL_POOL_DISCARD, &released, &pe);
+        if (released.released) { r->connection = NULL; }
+        diagnose(e, STAGE(RELEASE), next, NULL, &pe, true);
+        if (rc == VIREO_OK) { rc = next; }
+    }
+    report->cleanup_pending = pending(r);
+    return rc;
+}
+
+vireo_result_t vireo_mysql_node_repository_move_once(vireo_mysql_node_repository_t *r,
+    const vireo_mysql_node_actor_t *actor, const vireo_mysql_node_move_once_input_t *in,
+    uint32_t timeout, vireo_mysql_node_move_once_report_t *report, vireo_mysql_node_error_t *error)
+{
+    _Static_assert(VIREO_MYSQL_SCHEMA_AUDIT_ACTION_NODE_MOVE == 6, "fixed move audit SQL registry");
+    int saved = errno; vireo_mysql_node_error_t local = {0};
+    vireo_mysql_node_error_t *e = error != NULL ? error : &local; *e = local;
+    if (report != NULL) { memset(report, 0, sizeof(*report)); }
+    if (!valid(r) || report == NULL) {
+        e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_INVALID_ARGUMENT);
+    }
+    report->cleanup_pending = pending(r);
+    if (pending(r)) { e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_BUSY); }
+    if (actor == NULL || actor->user_id == 0 || actor->session_id == 0 || in == NULL ||
+        in->node_id == 0 || in->new_parent_id == 0 || in->name == NULL) {
+        e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_INVALID_ARGUMENT);
+    }
+    unsigned char event = 0, key = 0;
+    for (size_t i = 0; i < sizeof(in->request_id); ++i) { event |= in->request_id[i]; key |= in->idempotency_key[i]; }
+    if (event == 0 || key == 0) { e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_INVALID_ARGUMENT); }
+    if (in->name_length == 0 || in->name_length > VIREO_MYSQL_NODE_NAME_CAPACITY || timeout > VIREO_MYSQL_POOL_WAIT_MS_MAX) {
+        e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_RANGE);
+    }
+    bool bad = (in->name_length == 1 && in->name[0] == '.') ||
+        (in->name_length == 2 && in->name[0] == '.' && in->name[1] == '.');
+    for (size_t i = 0; i < in->name_length; ++i) { bad = bad || in->name[i] == 0 || in->name[i] == '/'; }
+    if (bad) { e->stage = STAGE(VALIDATE); return finish(saved, VIREO_RESULT_PROTOCOL); }
+    bool transaction = false, source_found = false, target_found = false, replied = false, changed = false;
+    uint64_t issued = 0, expires = 0, now = 0, audit = 0, occupied = 0, occupancy_state = 0;
+    vireo_mysql_node_value_t source = {0}, target = {0}; vireo_mysql_node_report_t auth = {0};
+    move_domain_t domain = {0};
+    vireo_mysql_pool_acquisition_t acquired = {0}; vireo_mysql_pool_error_t pe = {0}; vireo_mysql_execution_t ex;
+    vireo_result_t rc = r->ops.acquire(r->thread, r->pool, timeout, &r->lease, &acquired, &pe);
+    diagnose(e, STAGE(ACQUIRE), rc, NULL, &pe, false);
+    if (rc != VIREO_OK) { goto done; }
+    rc = r->ops.borrow(r->thread, r->pool, &r->lease, &r->connection);
+    diagnose(e, STAGE(BORROW), rc, NULL, NULL, false);
+    if (rc != VIREO_OK) { goto done; }
+    rc = write_command(r, "SET autocommit=0", NULL, 0, STAGE(BEGIN), false, false, &ex, &replied, e);
+    transaction = ex.execution_started;
+    if (rc != VIREO_OK) { goto done; }
+    rc = lock_move_user(r, actor->user_id, &auth, e);
+    if (rc != VIREO_OK) { goto done; }
+    rc = lock_session(r, actor, &issued, &expires, &auth, e);
+    if (rc != VIREO_OK) { goto done; }
+    move_receipt_t receipt = {0}; bool receipt_found = false;
+    rc = lock_move_receipt(r, actor->user_id, in, &receipt, &receipt_found, report, e);
+    if (rc != VIREO_OK) { goto done; }
+    if (receipt_found) {
+        rc = capture_utc(r, &now, e);
+        if (rc != VIREO_OK) { goto done; }
+        if (now < issued || now >= expires) {
+            report->issue = VIREO_MYSQL_NODE_AUTH_REJECTED; rc = VIREO_RESULT_NOT_FOUND;
+            diagnose(e, STAGE(SESSION), rc, NULL, NULL, false); goto done;
+        }
+        if (receipt.source_id != in->node_id || receipt.parent_id != in->new_parent_id ||
+            receipt.name_length != in->name_length || memcmp(receipt.name, in->name, in->name_length) != 0) {
+            report->issue = VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT; rc = VIREO_RESULT_DATABASE;
+            diagnose(e, STAGE(RECEIPT_READ), rc, NULL, NULL, false); goto done;
+        }
+        report->effect = VIREO_MYSQL_NODE_MOVE_EFFECT_RECOVERED;
+        report->node_id = receipt.node_id; report->audit_id = receipt.audit_id;
+        memcpy(report->idempotency_key, in->idempotency_key, 16);
+        goto done;
+    }
+    vireo_mysql_node_move_input_t move_input = {.node_id=in->node_id, .new_parent_id=in->new_parent_id,
+        .name=in->name, .name_length=in->name_length};
+    rc = lock_move_node(r, actor->user_id, in->node_id, true, STAGE(SOURCE), &source, &source_found, e);
+    if (rc != VIREO_OK) { goto done; }
+    if (source_found) {
+        rc = lock_move_node(r, actor->user_id, in->new_parent_id, true, STAGE(TARGET_PARENT), &target, &target_found, e);
+        if (rc != VIREO_OK) { goto done; }
+    }
+    if (!source_found || !target_found || target.kind != VIREO_MYSQL_NODE_DIRECTORY) {
+        domain = (move_domain_t){VIREO_MYSQL_NODE_NOT_FOUND,
+            source_found ? STAGE(TARGET_PARENT) : STAGE(SOURCE), VIREO_RESULT_NOT_FOUND};
+    } else if (!source.has_parent) {
+        domain = (move_domain_t){VIREO_MYSQL_NODE_ROOT_IMMOVABLE, STAGE(SOURCE), VIREO_RESULT_DATABASE};
+    } else {
+        rc = move_chain(r, actor->user_id, source.parent_id, 0, &domain, e);
+        if (rc != VIREO_OK) { goto done; }
+        if (domain.issue == VIREO_MYSQL_NODE_ISSUE_NONE) {
+            rc = move_chain(r, actor->user_id, in->new_parent_id,
+                source.kind == VIREO_MYSQL_NODE_DIRECTORY ? source.id : 0, &domain, e);
+            if (rc != VIREO_OK) { goto done; }
+        }
+        if (domain.issue == VIREO_MYSQL_NODE_ISSUE_NONE) {
+            rc = lock_move_name(r, actor->user_id, &move_input, &occupied, &occupancy_state, e);
+            if (rc != VIREO_OK) { goto done; }
+            changed = source.parent_id != in->new_parent_id || source.name_length != in->name_length ||
+                memcmp(source.name, in->name, in->name_length) != 0;
+            if (occupied != 0 && occupied != source.id) {
+                domain = (move_domain_t){VIREO_MYSQL_NODE_NAME_CONFLICT, STAGE(NAME_CHECK), VIREO_RESULT_DATABASE};
+            } else if ((!changed && (occupied != source.id || occupancy_state != 2)) || (changed && occupied == source.id)) {
+                rc = VIREO_RESULT_DATABASE; diagnose(e, STAGE(NAME_CHECK), rc, NULL, NULL, false); goto done;
+            }
+        }
+    }
+    rc = capture_utc(r, &now, e);
+    if (rc != VIREO_OK) { goto done; }
+    if (now < issued || now >= expires) {
+        report->issue = VIREO_MYSQL_NODE_AUTH_REJECTED; rc = VIREO_RESULT_NOT_FOUND;
+        diagnose(e, STAGE(SESSION), rc, NULL, NULL, false); goto done;
+    }
+    if (domain.issue != VIREO_MYSQL_NODE_ISSUE_NONE) {
+        report->issue = domain.issue; rc = domain.result;
+        diagnose(e, domain.stage, rc, NULL, NULL, false); goto done;
+    }
+    if (changed) {
+        source.updated_at_ms = now > source.updated_at_ms ? now : source.updated_at_ms;
+        rc = update_move(r, actor->user_id, &move_input, source.updated_at_ms, e);
+        if (rc != VIREO_OK) { goto done; }
+    }
+    static const char audit_sql[] = "INSERT INTO operation_audits(request_id,user_id,session_id,action,target_type,"
+        "target_id,target_hash,status,latency_us,detail,occurred_at_ms) VALUES(?,?,?,6,3,?,NULL,0,0,'',?)";
+    vireo_mysql_parameter_t a[5] = {
+        {.kind=VIREO_MYSQL_PARAMETER_BYTES, .value.span={in->request_id, sizeof(in->request_id)}},
+        U64(actor->user_id), U64(actor->session_id), U64(source.id), U64(now)};
+    rc = write_command(r, audit_sql, a, 5, STAGE(AUDIT), true, false, &ex, &replied, e);
+    if (rc != VIREO_OK) { goto done; }
+    audit = ex.insert_id;
+    rc = insert_move_receipt(r, actor->user_id, in, source.id, audit, now, e);
+    if (rc != VIREO_OK) { goto done; }
+    rc = capture_utc(r, &now, e);
+    if (rc != VIREO_OK) { goto done; }
+    if (now < issued || now >= expires) {
+        report->issue = VIREO_MYSQL_NODE_AUTH_REJECTED; rc = VIREO_RESULT_NOT_FOUND;
+        diagnose(e, STAGE(SESSION), rc, NULL, NULL, false); goto done;
+    }
+    rc = write_command(r, "COMMIT", NULL, 0, STAGE(COMMIT), false, false, &ex, &replied, e);
+    if (replied) {
+        report->commit = VIREO_MYSQL_NODE_MOVE_COMMITTED;
+        report->effect = VIREO_MYSQL_NODE_MOVE_EFFECT_APPLIED;
+        report->node_id = source.id; report->audit_id = audit;
+        memcpy(report->idempotency_key, in->idempotency_key, 16);
+    } else if (ex.execution_started) { report->commit = VIREO_MYSQL_NODE_MOVE_UNKNOWN; }
+done:
+    if (report->issue == VIREO_MYSQL_NODE_ISSUE_NONE) { report->issue = auth.issue; }
+    if (rc == VIREO_RESULT_DATABASE && report->issue == VIREO_MYSQL_NODE_ISSUE_NONE &&
+        e->database.mysql_code == 0 && (e->stage == STAGE(USER) || e->stage == STAGE(SESSION) ||
+        e->stage == STAGE(SOURCE) || e->stage == STAGE(TARGET_PARENT) || e->stage == STAGE(ANCESTOR) ||
+        e->stage == STAGE(NAME_CHECK) || e->stage == STAGE(UPDATE) || e->stage == STAGE(AUDIT) ||
+        e->stage == STAGE(RECEIPT_INSERT) || e->stage == STAGE(COMMIT))) { report->issue = VIREO_MYSQL_NODE_UNEXPECTED_RESULT; }
+    rc = cleanup_move_once(r, transaction, rc, report, e);
     return finish(saved, rc);
 }
 

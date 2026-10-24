@@ -263,7 +263,7 @@ int main(int argc,char **argv)
     CHECK(vireo_mysql_thread_attach(runtime,&thread,NULL)); size_t before=fd_count();
     vireo_mysql_connection_options_t options={argv[1],argv[2],password,argv[4],3,3,3};
     const vireo_mysql_migration_t *catalog=NULL; size_t count=0; CHECK(vireo_mysql_schema_catalog(&catalog,&count));
-    assert(count==9); count=1; /* 独立保留v1认证结构验证，不应用后续版本。 */
+    assert(count==10); count=1; /* 独立保留v1认证结构验证，不应用后续版本。 */
     vireo_mysql_migration_report_t report; vireo_mysql_migration_error_t error;
     CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&report,&error));
     assert(report.ready && report.connection_closed && report.applied_before==0 && report.applied_after==1 && report.steps_completed==2 && report.migrations_applied==1 && report.write_attempted);

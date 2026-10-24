@@ -3,7 +3,7 @@
  * FILE    : mysql_schema.c
  * AUTHOR  : bitofux
  * DATE    : 2026-10-18
- * BRIEF   : v1认证、v2节点、v3审计、v4上传及v5永久块/manifest、v6节点/副本及v7下载、v8清理任务及v9目录成功回执可信DDL；精确字节属于持久迁移hash合同。
+ * BRIEF   : v1认证、v2节点、v3审计、v4上传及v5永久块/manifest、v6节点/副本及v7下载、v8清理任务及v9目录成功回执及v10 MOVE回执扩展可信DDL；精确字节属于持久迁移hash合同。
  */
 #include <vireo/persistence/mysql_schema.h>
 
@@ -464,6 +464,19 @@ static const char directory_write_receipts_sql[] =
 static const vireo_mysql_migration_step_t directory_receipt_steps[] = {
     {directory_write_receipts_sql, sizeof(directory_write_receipts_sql)-1}
 };
+static const char directory_move_receipts_sql[] =
+    "ALTER TABLE directory_write_receipts\n"
+    "    ADD COLUMN request_node_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER request_parent_id,\n"
+    "    DROP CHECK directory_receipts_command_valid,\n"
+    "    ADD CONSTRAINT directory_receipts_command_valid CHECK (command IN (1027,1029)) ENFORCED,\n"
+    "    ADD CONSTRAINT directory_receipts_move_shape_valid CHECK (\n"
+    "        (command=1027 AND request_node_id IS NULL) OR\n"
+    "        (command=1029 AND request_node_id IS NOT NULL AND request_node_id>0 AND result_node_id=request_node_id)\n"
+    "    ) ENFORCED\n";
+
+static const vireo_mysql_migration_step_t directory_move_receipt_steps[] = {
+    {directory_move_receipts_sql, sizeof(directory_move_receipts_sql)-1}
+};
 static const vireo_mysql_migration_t catalog[] = {
     {1, initial_steps, 2},
     {2, node_steps, 2},
@@ -473,7 +486,8 @@ static const vireo_mysql_migration_t catalog[] = {
     {6, replica_steps, 2},
     {7, download_steps, 2},
     {8, gc_steps, 1},
-    {9, directory_receipt_steps, 1}
+    {9, directory_receipt_steps, 1},
+    {10, directory_move_receipt_steps, 1}
 };
 
 vireo_result_t vireo_mysql_schema_catalog(

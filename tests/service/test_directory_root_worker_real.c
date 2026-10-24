@@ -263,7 +263,7 @@ int main(int argc, char **argv) {
     vireo_mysql_migration_report_t migration;
     CHECK(vireo_mysql_migration_apply(thread, &options, catalog, count, &migration, NULL),
           VIREO_OK);
-    assert(migration.ready && migration.steps_completed == 15);
+    assert(migration.ready && migration.steps_completed==16);
     CHECK(vireo_mysql_connection_open(thread, &options, &observer, NULL), VIREO_OK);
     pool = NULL;
     /* 两次ROOT_INVARIANT各按042策略discard一连接；保留第三个供后续真实授权读。 */
