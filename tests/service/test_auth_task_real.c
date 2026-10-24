@@ -11,7 +11,9 @@
 #include <vireo/thread/thread_pool.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
+#include <time.h>
 
 static void sql(vireo_mysql_thread_t *thread, vireo_mysql_connection_t *connection,
     const char *text, const char *expected)
@@ -64,6 +66,15 @@ static vireo_result_t execute(void *context, vireo_task_t const *task)
     return VIREO_OK;
 }
 
+/** 仅测试manager有界等待公开队列的瞬时竞争，不重新执行认证业务。 */
+static void contention_pause(struct timespec const *start)
+{
+    assert(sched_yield() == 0);
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    assert(now.tv_sec - start->tv_sec < 5);
+}
+
 /** 以公开try_submit发布完整wire副本；原缓冲立即擦除，pool负责callback后task销毁。 */
 static void run(worker_context_t *f, size_t start, size_t count, size_t worker_count)
 {
@@ -84,10 +95,41 @@ static void run(worker_context_t *f, size_t start, size_t count, size_t worker_c
         CHECK(vireo_task_create_copy(f->trusted[i].metadata, wire, n, 4096, &task), VIREO_OK);
         CHECK(vireo_secure_clear(wire, sizeof(wire)), VIREO_OK);
         vireo_thread_pool_submit_report_t submitted;
-        CHECK(vireo_thread_pool_try_submit(pool, &task, &submitted), VIREO_OK); assert(task == NULL);
+        struct timespec start_time;
+        assert(clock_gettime(CLOCK_MONOTONIC, &start_time) == 0);
+        for (;;) {
+            errno = EDOM;
+            vireo_result_t const rc = vireo_thread_pool_try_submit(pool, &task, &submitted);
+            assert(errno == EDOM);
+            if (submitted.queue_report.transferred) {
+                assert(rc == VIREO_OK && task == NULL);
+                break;
+            }
+            /* 未交接才可重试同一owner；满队列或其他失败仍是测试错误。 */
+            assert(rc == VIREO_RESULT_BUSY && task != NULL && submitted.queue_called &&
+                submitted.stage == VIREO_THREAD_POOL_SUBMIT_STAGE_SUBMIT_QUEUE &&
+                submitted.queue_report.stage == VIREO_TASK_QUEUE_STAGE_LOCK &&
+                submitted.queue_report.pthread_error == EBUSY);
+            contention_pause(&start_time);
+        }
     }
     vireo_thread_pool_shutdown_report_t shutdown;
-    CHECK(vireo_thread_pool_shutdown_and_join(pool, VIREO_TASK_QUEUE_DRAIN, &shutdown), VIREO_OK);
+    struct timespec start_time;
+    assert(clock_gettime(CLOCK_MONOTONIC, &start_time) == 0);
+    for (;;) {
+        errno = EDOM;
+        vireo_result_t const rc = vireo_thread_pool_shutdown_and_join(pool, VIREO_TASK_QUEUE_DRAIN, &shutdown);
+        assert(errno == EDOM);
+        if (rc == VIREO_OK) break;
+        /* 只恢复关闭/回收资格观察的竞争，不重试pthread join或worker错误。 */
+        assert(rc == VIREO_RESULT_BUSY &&
+            ((shutdown.stage == VIREO_THREAD_POOL_SHUTDOWN_STAGE_CLOSE_QUEUE && !shutdown.join_called &&
+              shutdown.close_report.stage == VIREO_TASK_QUEUE_STAGE_LOCK &&
+              shutdown.close_report.pthread_error == EBUSY) ||
+             (shutdown.stage == VIREO_THREAD_POOL_SHUTDOWN_STAGE_JOIN_WORKERS &&
+              shutdown.pool_report.stage == VIREO_THREAD_POOL_STAGE_CHECK_QUEUE)));
+        contention_pause(&start_time);
+    }
     assert(shutdown.pool_report.joined_count == worker_count);
     for (size_t i = start; i < start + count; ++i) assert(f->completed[i] == 1);
     CHECK(vireo_thread_pool_destroy(&pool), VIREO_OK);
