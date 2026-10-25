@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "mysql_node_repository_internal.h"
 #include <vireo/persistence/mysql_schema.h>
+#include <vireo/persistence/mysql_node_remove_receipt.h>
 #include <vireo/persistence/mysql_user_repository.h>
 #include <assert.h>
 #include <dirent.h>
@@ -233,7 +234,7 @@ static void fault_cases(void)
     }
     puts("PASS actual SQL node/object/audit rollback at object failure, audit/UTC expiry, and commit/cleanup seams; seams are not native network failures");
 }
-struct worker { bool first,mkdir,move,logout,bob;uint64_t id,parent;const char *name;unsigned char event;vireo_result_t result;vireo_mysql_node_soft_delete_report_t report;vireo_mysql_node_issue_t issue; };
+struct worker { bool first,mkdir,move,logout,bob,once;uint64_t id,parent;const char *name;unsigned char event,key;vireo_result_t result;vireo_mysql_node_soft_delete_report_t report;vireo_mysql_node_remove_once_report_t once_report;vireo_mysql_node_issue_t issue; };
 static vireo_result_t second_execute(vireo_mysql_thread_t *t,vireo_mysql_statement_t *s,
     const vireo_mysql_parameter_t *p,size_t n,vireo_mysql_execution_t *out,vireo_mysql_error_t *e)
 {
@@ -253,7 +254,12 @@ static void *work(void *arg)
     } else {
         vireo_mysql_node_ops_t ops=vireo_mysql_node_native_ops;ops.utc=w->first ? paused_utc : fixed_utc;if(!w->first) { ops.execute=second_execute; }
         vireo_mysql_node_repository_t *r=NULL;CHECK(vireo_mysql_node_repository_create_with_ops(t,pool,&r,NULL,&ops),VIREO_OK);
-        if(w->mkdir) {
+        if(w->once) {
+            vireo_mysql_node_remove_once_input_t in={.node_id=w->id,.idempotency_key={w->key},.request_id={0x73}};
+            in.request_id[15]=w->event;errno=EDOM;
+            w->result=vireo_mysql_node_repository_soft_delete_once(r,who,&in,0,&w->once_report,NULL);
+            assert(errno==EDOM);w->issue=w->once_report.issue;
+        } else if(w->mkdir) {
             vireo_mysql_node_mkdir_input_t in={.parent_id=w->parent,.name=(const unsigned char *)w->name,.name_length=strlen(w->name),.request_id={0x71}};in.request_id[15]=w->event;
             vireo_mysql_node_mkdir_report_t out;errno=EDOM;w->result=vireo_mysql_node_repository_mkdir(r,who,&in,0,&out,NULL);assert(errno==EDOM);w->issue=out.issue;
         } else if(w->move) {
@@ -311,6 +317,40 @@ static void concurrent(unsigned scenario)
     n=snprintf(sql,sizeof(sql),"UPDATE file_nodes SET name=CONCAT('retained-',id) WHERE id=%llu",(unsigned long long)other);assert(n>0 && (size_t)n<sizeof(sql));mutate(sql);
     if(scenario==5) { vireo_mysql_node_soft_delete_input_t in=delete_input(other);(void)delete_node(alice,&in,VIREO_RESULT_NOT_FOUND,VIREO_MYSQL_NODE_AUTH_REJECTED); }
 }
+/* Pause the first transaction after its locks, and observe the second waiting in InnoDB. */
+static void concurrent_once(unsigned scenario)
+{
+    char name[40];int n=snprintf(name,sizeof(name),"once-race-%u",scenario);assert(n>0 && (size_t)n<sizeof(name));
+    unsigned hash=0xd2u+scenario;object_fixture(hash,2,1);
+    uint64_t id=file_fixture(bob,bob_root,name,hash,2);
+    struct worker first={.first=true,.bob=true,.once=true,.id=id,.event=(unsigned char)(scenario*2+1),.key=(unsigned char)(0x80u+scenario*2)};
+    struct worker second={.bob=true,.once=true,.id=id,.event=(unsigned char)(scenario*2+2),.key=first.key};
+    if(scenario==1) { second.id=bob_root; }
+    if(scenario==2) { ++second.key; }
+    phase=0;release_first=false;second_started=false;second_done=false;independent_user=false;assert(lock_waits()==0);
+    uint64_t audits=scalar("SELECT COUNT(*) FROM operation_audits"),receipts=scalar("SELECT COUNT(*) FROM node_remove_receipts");
+    pthread_t t1,t2;assert(!pthread_create(&t1,NULL,work,&first));assert(!pthread_mutex_lock(&mutex));
+    struct timespec due=deadline();while(phase!=1) { assert(!pthread_cond_timedwait(&condition,&mutex,&due)); }assert(!pthread_mutex_unlock(&mutex));
+    assert(!pthread_create(&t2,NULL,work,&second));assert(!pthread_mutex_lock(&mutex));wait_flag(&second_started);assert(!pthread_mutex_unlock(&mutex));
+    bool observed=false;due=deadline();
+    do { if(lock_waits()>0) { observed=true;break; }struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));if(now.tv_sec>=due.tv_sec) { break; }struct timespec pause={0,1000000};assert(!nanosleep(&pause,NULL)); }while(!observed);
+    assert(observed);assert(!pthread_mutex_lock(&mutex));assert(!second_done);release_first=true;
+    assert(!pthread_cond_broadcast(&condition) && !pthread_mutex_unlock(&mutex));
+    assert(!pthread_join(t1,NULL) && !pthread_join(t2,NULL));
+    assert(first.result==VIREO_OK && first.once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED && second_done);
+    if(scenario==0) {
+        assert(second.result==VIREO_OK && second.once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_RECOVERED &&
+            second.once_report.audit_id==first.once_report.audit_id && second.once_report.deleted_at_ms==first.once_report.deleted_at_ms);
+    } else {
+        assert(second.result==(scenario==1 ? VIREO_RESULT_DATABASE : VIREO_RESULT_NOT_FOUND) &&
+            second.issue==(scenario==1 ? VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT : VIREO_MYSQL_NODE_NOT_FOUND) &&
+            second.once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_NONE && second.once_report.rollback_confirmed);
+    }
+    assert(field(id,"state")==3 && refs(hash)==0 && scalar("SELECT COUNT(*) FROM operation_audits")==audits+1 &&
+        scalar("SELECT COUNT(*) FROM node_remove_receipts")==receipts+1);
+    printf("PASS actual InnoDB row-lock wait: once race %u; exactly one node/ref/audit/receipt change\n",scenario);
+    ++cases;refill_pool();
+}
 static size_t fd_count(void)
 { DIR *d=opendir("/proc/self/fd");assert(d);size_t n=0;while(readdir(d)) { ++n; }assert(!closedir(d));return n; }
 static uint64_t insert_dir(uint64_t parent,const char *name)
@@ -337,7 +377,7 @@ int main(int argc,char **argv)
     CHECK(vireo_mysql_runtime_create(&runtime,NULL),VIREO_OK);CHECK(vireo_mysql_thread_attach(runtime,&thread,NULL),VIREO_OK);
     vireo_mysql_connection_options_t options={argv[1],argv[2],password,argv[4],3,3,3};
     const vireo_mysql_migration_t *catalog;size_t count;CHECK(vireo_mysql_schema_catalog(&catalog,&count),VIREO_OK);vireo_mysql_migration_report_t migration;
-    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&migration,NULL),VIREO_OK);assert(migration.ready && migration.steps_completed==16);
+    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&migration,NULL),VIREO_OK);assert(migration.ready && migration.steps_completed==17);
     CHECK(vireo_mysql_connection_open(thread,&options,&observer,NULL),VIREO_OK);
     vireo_mysql_pool_options_t config={options,4,4,VIREO_MYSQL_POOL_MEMORY_MAX};CHECK(vireo_mysql_pool_create(thread,&config,&pool,NULL),VIREO_OK);
     CHECK(vireo_mysql_user_repository_create(thread,pool,&policy,&users,NULL),VIREO_OK);
@@ -391,6 +431,26 @@ int main(int argc,char **argv)
     n=snprintf(sql,sizeof(sql),"UPDATE sessions SET expires_at_ms=18446744073709551615 WHERE id=%llu",(unsigned long long)bob.session_id);assert(n>0 && (size_t)n<sizeof(sql));mutate(sql);
     uint64_t native_id=mkdir_at(bob,bob_root,"native");CHECK(vireo_mysql_node_repository_destroy(&nodes,NULL),VIREO_OK);CHECK(vireo_mysql_node_repository_create(thread,pool,&nodes,NULL),VIREO_OK);
     in=delete_input(native_id);vireo_mysql_node_soft_delete_report_t native;CHECK(vireo_mysql_node_repository_soft_delete(nodes,&bob,&in,0,&native,NULL),VIREO_OK);assert(native.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED && native.deleted_at_ms>3000);++cases;
+    sample_ms=2000;recreate(false);object_fixture(0xd1,2,1);uint64_t once_node=file_fixture(bob,bob_root,"once-remove",0xd1,2);
+    n=snprintf(sql,sizeof(sql),"UPDATE file_nodes SET updated_at_ms=2500 WHERE id=%llu",(unsigned long long)once_node);
+    assert(n>0 && (size_t)n<sizeof(sql));mutate(sql);
+    vireo_mysql_node_remove_once_input_t once={.node_id=once_node,.idempotency_key={0x61},.request_id={0x71}};
+    vireo_mysql_node_remove_once_report_t once_report;vireo_mysql_node_error_t once_error;
+    uint64_t before_once_audits=scalar("SELECT COUNT(*) FROM operation_audits");
+    CHECK(vireo_mysql_node_repository_soft_delete_once(nodes,&bob,&once,0,&once_report,&once_error),VIREO_OK);
+    assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED && once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED &&
+        once_report.node_id==once_node && once_report.audit_id && once_report.deleted_at_ms==2500 && !once_report.rollback_confirmed);
+    assert(field(once_node,"state")==3 && refs(0xd1)==0 && scalar("SELECT COUNT(*) FROM node_remove_receipts")==1 &&
+        scalar("SELECT COUNT(*) FROM operation_audits")==before_once_audits+1);
+    vireo_mysql_node_remove_once_report_t recovered;CHECK(vireo_mysql_node_repository_soft_delete_once(nodes,&bob,&once,0,&recovered,NULL),VIREO_OK);
+    assert(recovered.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_RECOVERED && recovered.commit==VIREO_MYSQL_NODE_SOFT_DELETE_NOT_COMMITTED &&
+        recovered.node_id==once_node && recovered.audit_id==once_report.audit_id && recovered.deleted_at_ms==once_report.deleted_at_ms && recovered.rollback_confirmed);
+    assert(refs(0xd1)==0 && scalar("SELECT COUNT(*) FROM node_remove_receipts")==1 && scalar("SELECT COUNT(*) FROM operation_audits")==before_once_audits+1);
+    uint64_t conflict_node=mkdir_at(bob,bob_root,"once-conflict");once.node_id=conflict_node;
+    vireo_mysql_node_remove_once_report_t conflict;CHECK(vireo_mysql_node_repository_soft_delete_once(nodes,&bob,&once,0,&conflict,NULL),VIREO_RESULT_DATABASE);
+    assert(conflict.issue==VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT && conflict.commit==VIREO_MYSQL_NODE_SOFT_DELETE_NOT_COMMITTED && conflict.rollback_confirmed && field(conflict_node,"state")==2);
+    ++cases;
+    for(unsigned scenario=0;scenario<3;++scenario) { concurrent_once(scenario); }
     CHECK(vireo_mysql_node_repository_destroy(&nodes,NULL),VIREO_OK);assert(saved.node_id==dir && saved.audit_id && saved.deleted_at_ms==2000);
     CHECK(vireo_mysql_user_repository_destroy(&users,NULL),VIREO_OK);bool closed=false;CHECK(vireo_mysql_pool_close(pool,&closed,NULL),VIREO_OK);assert(closed);
     CHECK(vireo_mysql_pool_destroy(thread,&pool,NULL),VIREO_OK);CHECK(vireo_mysql_connection_destroy(thread,&observer),VIREO_OK);

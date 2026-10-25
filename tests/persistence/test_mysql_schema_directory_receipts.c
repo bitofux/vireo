@@ -21,7 +21,7 @@ static void hash_u32(EVP_MD_CTX *ctx, uint32_t v)
 int main(void)
 {
     const vireo_mysql_migration_t *catalog=NULL; size_t count=0;
-    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==10);
+    assert(vireo_mysql_schema_catalog(&catalog,&count)==VIREO_OK && count==11);
     static const char *const golden[]={
         "58c6116c0920294129f40afe777c4e3f616b4532393ef09b7fddbc4822f688be",
         "d8fc1a1e07981af9d4c5db32c9cb71d66cfd326b13e7eb771cb21723d96ed90c",

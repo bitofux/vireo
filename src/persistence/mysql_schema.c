@@ -477,6 +477,28 @@ static const char directory_move_receipts_sql[] =
 static const vireo_mysql_migration_step_t directory_move_receipt_steps[] = {
     {directory_move_receipts_sql, sizeof(directory_move_receipts_sql)-1}
 };
+static const char node_remove_receipts_sql[] =
+    "CREATE TABLE node_remove_receipts (\n"
+    "    user_id BIGINT UNSIGNED NOT NULL,\n"
+    "    command SMALLINT UNSIGNED NOT NULL,\n"
+    "    idempotency_key VARBINARY(16) NOT NULL,\n"
+    "    format_version SMALLINT UNSIGNED NOT NULL,\n"
+    "    request_node_id BIGINT UNSIGNED NOT NULL,\n"
+    "    result_node_id BIGINT UNSIGNED NOT NULL,\n"
+    "    audit_id BIGINT UNSIGNED NOT NULL,\n"
+    "    created_at_ms BIGINT UNSIGNED NOT NULL,\n"
+    "    PRIMARY KEY (user_id, command, idempotency_key),\n"
+    "    CONSTRAINT node_remove_receipts_user_valid CHECK (user_id > 0) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_command_valid CHECK (command = 1028) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_key_valid CHECK (OCTET_LENGTH(idempotency_key) = 16 AND idempotency_key <> REPEAT(X'00', 16)) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_format_valid CHECK (format_version = 1) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_request_node_valid CHECK (request_node_id > 0) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_result_valid CHECK (result_node_id > 0 AND result_node_id = request_node_id) ENFORCED,\n"
+    "    CONSTRAINT node_remove_receipts_audit_valid CHECK (audit_id > 0) ENFORCED\n"
+    ") ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin";
+static const vireo_mysql_migration_step_t node_remove_receipt_steps[] = {
+    {node_remove_receipts_sql, sizeof(node_remove_receipts_sql)-1}
+};
 static const vireo_mysql_migration_t catalog[] = {
     {1, initial_steps, 2},
     {2, node_steps, 2},
@@ -487,7 +509,8 @@ static const vireo_mysql_migration_t catalog[] = {
     {7, download_steps, 2},
     {8, gc_steps, 1},
     {9, directory_receipt_steps, 1},
-    {10, directory_move_receipt_steps, 1}
+    {10, directory_move_receipt_steps, 1},
+    {11, node_remove_receipt_steps, 1}
 };
 
 vireo_result_t vireo_mysql_schema_catalog(

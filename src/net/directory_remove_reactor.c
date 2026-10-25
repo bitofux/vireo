@@ -1,0 +1,36 @@
+/*
+ * NODE_REMOVE uses the same bounded Reactor state machine as NODE_MOVE.
+ * Specialize its protocol, task/completion codecs, report, operation slot and
+ * service state at compile time so the irreversible delivery path stays exact.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include "directory_remove_reactor_internal.h"
+
+#define move remove
+#define vireo_move_reactor_state_t vireo_remove_reactor_state_t
+#define vireo_move_receipt_t vireo_remove_receipt_t
+#define vireo_move_reactor_workspace_t vireo_remove_reactor_workspace_t
+#define vireo_directory_move_reactor_report_t vireo_directory_remove_reactor_report_t
+#define vireo_directory_move_completion_outcome_t vireo_directory_remove_completion_outcome_t
+#define vireo_directory_move_completion_decode vireo_directory_remove_completion_decode
+#define vireo_directory_move_task_create vireo_directory_remove_task_create
+#define vireo_node_move_request_t vireo_node_remove_request_t
+#define vireo_node_move_response_t vireo_node_remove_response_t
+#define vireo_node_move_issue_t vireo_node_remove_issue_t
+#define vireo_node_move_request_decode vireo_node_remove_request_decode
+#define vireo_node_move_response_encode vireo_node_remove_response_encode
+#undef VIREO_NODE_MOVE_REQUEST_FRAME_MAX
+#undef VIREO_NODE_MOVE_RESPONSE_FRAME_MAX
+#undef VIREO_COMMAND_NODE_MOVE
+#define VIREO_NODE_MOVE_REQUEST_FRAME_MAX VIREO_NODE_REMOVE_REQUEST_FRAME_SIZE
+#define VIREO_NODE_MOVE_RESPONSE_FRAME_MAX VIREO_NODE_REMOVE_RESPONSE_FRAME_MAX
+#define VIREO_COMMAND_NODE_MOVE VIREO_COMMAND_NODE_REMOVE
+#define vireo_move_reactor_default_ops vireo_remove_reactor_default_ops
+#define vireo_move_reactor_head vireo_remove_reactor_head
+#define vireo_move_reactor_finish_head vireo_remove_reactor_finish_head
+#define vireo_move_reactor_completions vireo_remove_reactor_completions
+#define vireo_move_reactor_discard vireo_remove_reactor_discard
+#define vireo_move_reactor_clear_request vireo_remove_reactor_clear_request
+#define vireo_directory_move_reactor_create vireo_directory_remove_reactor_create
+#define vireo_directory_move_reactor_inspect vireo_directory_remove_reactor_inspect
+#include "directory_move_reactor.c"

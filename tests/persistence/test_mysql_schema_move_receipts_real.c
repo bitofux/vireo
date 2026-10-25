@@ -72,6 +72,17 @@ static void metadata(void)
     scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND table_name='directory_write_receipts' AND constraint_type='FOREIGN KEY'","0");
     scalar("SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND event_object_table='directory_write_receipts'","0");
 }
+static void remove_metadata(void)
+{
+    scalar("SELECT GROUP_CONCAT(CONCAT(column_name,':',column_type,':',is_nullable) ORDER BY ordinal_position SEPARATOR '|') FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='node_remove_receipts'",
+        "user_id:bigint unsigned:NO|command:smallint unsigned:NO|idempotency_key:varbinary(16):NO|format_version:smallint unsigned:NO|request_node_id:bigint unsigned:NO|result_node_id:bigint unsigned:NO|audit_id:bigint unsigned:NO|created_at_ms:bigint unsigned:NO");
+    scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='node_remove_receipts' AND (column_default IS NOT NULL OR extra<>'')","0");
+    scalar("SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',') FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='node_remove_receipts' AND index_name='PRIMARY'","user_id,command,idempotency_key");
+    scalar("SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='node_remove_receipts'","1");
+    scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND table_name='node_remove_receipts' AND constraint_type='CHECK' AND enforced='YES'","7");
+    scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND table_name='node_remove_receipts' AND constraint_type='FOREIGN KEY'","0");
+    scalar("SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND event_object_table='node_remove_receipts'","0");
+}
 static void boundaries(void)
 {
     unsigned char key[16]={2},name[255];memset(name,0xff,sizeof(name));
@@ -100,22 +111,25 @@ int main(int argc,char **argv)
     struct sigaction sa={0};sa.sa_handler=SIG_IGN;assert(!sigemptyset(&sa.sa_mask) && !sigaction(SIGPIPE,&sa,NULL));
     vireo_mysql_runtime_t *runtime=NULL;CHECK(vireo_mysql_runtime_create(&runtime,NULL));CHECK(vireo_mysql_thread_attach(runtime,&thread,NULL));
     vireo_mysql_connection_options_t options={argv[1],argv[2],password,argv[4],3,3,3};
-    const vireo_mysql_migration_t *catalog;size_t count;CHECK(vireo_mysql_schema_catalog(&catalog,&count));assert(count==10);
+    const vireo_mysql_migration_t *catalog;size_t count;CHECK(vireo_mysql_schema_catalog(&catalog,&count));assert(count==11);
     vireo_mysql_migration_report_t r;
-    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.steps_completed==16 && r.applied_after==10);
+    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.steps_completed==17 && r.applied_after==11);
     CHECK(vireo_mysql_connection_open(thread,&options,&connection,NULL));metadata();
+    remove_metadata();
     CHECK(vireo_mysql_connection_destroy(thread,&connection));
     options.database="vireo_move_upgrade";
     CHECK(vireo_mysql_migration_apply(thread,&options,catalog,9,&r,NULL));assert(r.ready && r.steps_completed==15 && r.applied_after==9);
     CHECK(vireo_mysql_connection_open(thread,&options,&connection,NULL));
     static const char old_insert[]="INSERT INTO directory_write_receipts(user_id,command,idempotency_key,format_version,request_parent_id,request_name,result_node_id,audit_id,created_at_ms) VALUES(7,1027,X'01000000000000000000000000000000',1,22,X'616263',31,51,0)";
     command(old_insert);char before[16384],after[16384];snapshot(before);
-    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.applied_before==9 && r.applied_after==10 && r.migrations_applied==1 && r.steps_completed==1);
+    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,10,&r,NULL));assert(r.ready && r.applied_before==9 && r.applied_after==10 && r.migrations_applied==1 && r.steps_completed==1);
     snapshot(after);assert(!strcmp(before,after));metadata();
+    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.applied_before==10 && r.applied_after==11 && r.migrations_applied==1 && r.steps_completed==1);
+    remove_metadata();
     scalar("SELECT COUNT(*) FROM directory_write_receipts WHERE command=1027 AND request_node_id IS NULL","1");
     command("INSERT INTO directory_write_receipts(user_id,command,idempotency_key,format_version,request_parent_id,request_name,result_node_id,audit_id,created_at_ms) VALUES(8,1027,X'01000000000000000000000000000000',1,22,X'616263',31,51,0)");
     boundaries();snapshot(before);
-    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.applied_before==10 && r.applied_after==10 && !r.write_attempted && !r.steps_completed);snapshot(after);assert(!strcmp(before,after));
+    CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&r,NULL));assert(r.ready && r.applied_before==11 && r.applied_after==11 && !r.write_attempted && !r.steps_completed);snapshot(after);assert(!strcmp(before,after));
     CHECK(vireo_mysql_connection_destroy(thread,&connection));CHECK(vireo_mysql_thread_detach(&thread));CHECK(vireo_mysql_runtime_destroy(&runtime));memset(password,0,sizeof(password));
-    printf("PASS empty full v10 catalog and repeat; v9 with MKDIR rows -> v10 one-step upgrade preserves old rows/INSERT; ten columns, nine enforced checks; %zu native3819 shape rejections; NULL/source/result/scopes/rollback\n",rejected);return 0;
+    printf("PASS empty full v11 catalog and repeat; v9 with MKDIR rows -> v10 then v11 one-step upgrades preserve rows; node-remove columns/checks; %zu native3819 shape rejections; NULL/source/result/scopes/rollback\n",rejected);return 0;
 }

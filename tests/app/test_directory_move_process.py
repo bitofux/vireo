@@ -70,7 +70,8 @@ def real(server, helper, endpoint, user, password_file, database):
         text=path.read_text();assert 'AddressSanitizer' not in text and 'runtime error:' not in text
         v={k:int(n) for k,n in re.findall(r'(\w+)=(-?\d+)',text)}
         assert v['clean']==1 and v['cleanup']==0 and v['created']==v['joined']==2
-        assert (v['queues_closed'],v['queues_drained'])==(127,126) and v['final_drain_turns']>0
+        expected_queues=(127,126) if 'fd_before' in v else (255,254)
+        assert (v['queues_closed'],v['queues_drained'])==expected_queues and v['final_drain_turns']>0
         assert v['audit_created']==v['audit_joined']
         if 'fd_before' in v:assert v['fd_before']==v['fd_after']
         if sig:assert v['signal']==sig

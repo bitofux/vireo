@@ -344,7 +344,7 @@ int main(int argc,char **argv)
     vireo_mysql_runtime_t *runtime=NULL; CHECK(vireo_mysql_runtime_create(&runtime,NULL));
     CHECK(vireo_mysql_thread_attach(runtime,&thread,NULL)); size_t before=fd_count();
     vireo_mysql_connection_options_t options={argv[1],argv[2],password,argv[4],3,3,3};
-    const vireo_mysql_migration_t *catalog=NULL; size_t count=0; CHECK(vireo_mysql_schema_catalog(&catalog,&count)); assert(count==10); count=3; /* 独立保留v3审计前缀回归。 */
+    const vireo_mysql_migration_t *catalog=NULL; size_t count=0; CHECK(vireo_mysql_schema_catalog(&catalog,&count)); assert(count==11); count=3; /* 独立保留v3审计前缀回归。 */
     vireo_mysql_migration_report_t report; vireo_mysql_migration_error_t error;
     CHECK(vireo_mysql_migration_apply(thread,&options,catalog,count,&report,&error));
     assert(report.ready && report.connection_closed && report.applied_before==0 && report.applied_after==3 && report.steps_completed==5 && report.migrations_applied==3 && report.write_attempted);

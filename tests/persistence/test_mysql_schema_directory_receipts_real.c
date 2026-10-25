@@ -102,7 +102,7 @@ int main(int argc,char **argv)
     struct sigaction sa={0};sa.sa_handler=SIG_IGN;assert(!sigemptyset(&sa.sa_mask) && !sigaction(SIGPIPE,&sa,NULL));
     vireo_mysql_runtime_t *runtime=NULL;CHECK(vireo_mysql_runtime_create(&runtime,NULL));CHECK(vireo_mysql_thread_attach(runtime,&thread,NULL));
     vireo_mysql_connection_options_t options={argv[1],argv[2],password,argv[4],3,3,3};
-    const vireo_mysql_migration_t *catalog;size_t count;CHECK(vireo_mysql_schema_catalog(&catalog,&count));assert(count==10);count=9; /* 独立保留v8->v9原始DDL回归；v10另测。 */
+    const vireo_mysql_migration_t *catalog;size_t count;CHECK(vireo_mysql_schema_catalog(&catalog,&count));assert(count==11);count=9; /* 独立保留v8->v9原始DDL回归；v10另测。 */
     vireo_mysql_migration_report_t r;CHECK(vireo_mysql_migration_apply(thread,&options,catalog,8,&r,NULL));assert(r.ready && r.steps_completed==14 && r.applied_after==8);
     CHECK(vireo_mysql_connection_open(thread,&options,&connection,NULL));
     scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='directory_write_receipts'","0");

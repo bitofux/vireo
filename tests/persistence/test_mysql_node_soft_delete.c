@@ -2,6 +2,7 @@
  * DATE : 2026-10-21; BRIEF : 软删除、对象引用、拒绝优先级与逐资源故障/提交事实。 */
 #define _POSIX_C_SOURCE 200809L
 #include "mysql_node_repository_internal.h"
+#include <vireo/persistence/mysql_node_remove_receipt.h>
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -9,18 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 #define CHECK(call,want) do { errno=EDOM; vireo_result_t got_=(call); if(got_!=(want)) { fprintf(stderr,"line %d got %d want %d\n",__LINE__,(int)got_,(int)(want)); abort(); } assert(errno==EDOM); } while(0)
-enum op { BEGIN, USER, SESSION, SOURCE, ANCESTOR, CHILDREN, OBJECT, UPDATE_NODE, UPDATE_OBJECT, AUDIT, COMMIT, ROLLBACK, OPS };
+enum op { BEGIN, USER, SESSION, SOURCE, ANCESTOR, CHILDREN, OBJECT, UPDATE_NODE, UPDATE_OBJECT, AUDIT, COMMIT, ROLLBACK, RECEIPT_READ, RECEIPT_INSERT, OPS };
 struct node { uint64_t id,owner,parent,created,updated,size; unsigned kind,state; unsigned char name[255],hash[32];size_t length; };
 struct statement { enum op op;size_t fetched;struct node *node;char numbers[11][32]; };
 static struct {
     size_t calls,fail_at,allocations,statements,leases,prepared[OPS],utc_calls,count;
-    size_t pending_nodes,pending_audits,nodes,audits,pending_objects,objects;
+    size_t pending_nodes,pending_audits,nodes,audits,pending_objects,objects,pending_receipts,receipts;
     uint64_t refs,object_size,object_state,object_created,object_updated,verified;
+    uint64_t receipt_node,receipt_audit,receipt_created;
     bool missing_object,verified_null;
     uint64_t first_ms,second_ms;
     unsigned shape,utc_mode;
     int bad_result,duplicate,execute_error,close_error,keep_close,shape_op;
     bool missing_user,disabled,missing_session,revoked,wrong_session;
+    bool receipt_found,receipt_malformed,receipt_duplicate;
     bool before_native,apply_failed_commit,keep_release,consume_release_error,partial_acquire,missing_name;
     vireo_mysql_pool_disposition_t disposition;
     struct node tree[600];
@@ -32,6 +35,8 @@ static vireo_mysql_node_repository_t *repo;
 static const vireo_mysql_node_actor_t actor={7,51};
 static vireo_mysql_node_soft_delete_input_t input;
 static vireo_mysql_node_soft_delete_report_t report;
+static vireo_mysql_node_remove_once_input_t once_input;
+static vireo_mysql_node_remove_once_report_t once_report;
 static vireo_mysql_node_error_t error;
 static size_t scenarios;
 static bool fail(void) { return ++m.calls==m.fail_at; }
@@ -64,7 +69,7 @@ static vireo_result_t release(vireo_mysql_thread_t *t,vireo_mysql_pool_t *p,vire
     assert(t==thread && p==pool && lease->owner==pool && !m.statements && m.leases==1);
     *out=(vireo_mysql_pool_release_t){0};*e=(vireo_mysql_pool_error_t){0};m.disposition=disposition;
     if(fail() || m.keep_release) { return VIREO_RESULT_INTERNAL; }
-    if(disposition==VIREO_MYSQL_POOL_DISCARD) { m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0; }
+    if(disposition==VIREO_MYSQL_POOL_DISCARD) { m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0;m.pending_receipts=0; }
     *lease=(vireo_mysql_lease_t){0};out->released=true;--m.leases;
     return m.consume_release_error ? VIREO_RESULT_DATABASE : VIREO_OK;
 }
@@ -86,6 +91,8 @@ static enum op identify(const char *sql)
     if(strstr(sql,"FROM objects")) {
         assert(!strcmp(sql,"SELECT object_hash,size,state,ref_count,storage_class,created_at_ms,updated_at_ms,verified_at_ms FROM objects WHERE object_hash=? FOR UPDATE") && m.prepared[ANCESTOR] && !m.prepared[CHILDREN]);return OBJECT;
     }
+    if(strstr(sql,"FROM node_remove_receipts")) { return RECEIPT_READ; }
+    if(strstr(sql,"INSERT INTO node_remove_receipts")) { return RECEIPT_INSERT; }
     if(strstr(sql,"UPDATE file_nodes")) {
         assert(!strcmp(sql,"UPDATE file_nodes SET state=3,updated_at_ms=?,deleted_at_ms=? WHERE owner_id=? AND id=? AND state=2") && m.utc_calls==1);return UPDATE_NODE;
     }
@@ -99,7 +106,11 @@ static vireo_result_t prepare(vireo_mysql_thread_t *t,vireo_mysql_connection_t *
 {
     assert(t==thread && c==(void *)&connection_storage && strlen(sql)==n && !*out && !m.statements);
     enum op op=identify(sql);++m.prepared[op];bool old_read=op==SESSION;
-    assert(limits->max_parameters==(old_read ? 4u : 5u) && limits->max_parameter_bytes==(old_read ? 0u : 255u) && limits->max_columns==11 && limits->max_cell_bytes==255 && limits->max_memory_bytes==32768);
+    if(op >= RECEIPT_READ) {
+        assert(limits->max_parameters==7u && limits->max_columns==11u && limits->max_parameter_bytes==271u && limits->max_cell_bytes==255 && limits->max_memory_bytes==32768);
+    } else {
+        assert(limits->max_parameters==(old_read ? 4u : 5u) && limits->max_parameter_bytes==(old_read ? 0u : 255u) && limits->max_columns==11 && limits->max_cell_bytes==255 && limits->max_memory_bytes==32768);
+    }
     *e=(vireo_mysql_error_t){0};if(fail()) { e->mysql_code=2013;return VIREO_RESULT_DATABASE; }
     struct statement *s=calloc(1,sizeof(*s));assert(s);s->op=op;*out=(void *)s;++m.statements;return VIREO_OK;
 }
@@ -109,10 +120,10 @@ static void span(const vireo_mysql_parameter_t *p,const void *bytes,size_t n)
 { assert(p->kind==VIREO_MYSQL_PARAMETER_BYTES && p->value.span.length==n && !memcmp(p->value.span.data,bytes,n)); }
 static void apply_commit(void)
 {
-    assert(m.pending_nodes==1 && m.pending_audits==1 && m.pending_objects<=1);
+    assert(m.pending_nodes==1 && m.pending_audits==1 && m.pending_objects<=1 && m.pending_receipts<=1);
     m.nodes+=m.pending_nodes;m.audits+=m.pending_audits;m.objects+=m.pending_objects;
     if(m.pending_objects) { assert(m.refs);--m.refs; }
-    m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0;
+    m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0;m.receipts+=m.pending_receipts;m.pending_receipts=0;
 }
 static vireo_result_t execute(vireo_mysql_thread_t *t,vireo_mysql_statement_t *statement,
     const vireo_mysql_parameter_t *p,size_t n,vireo_mysql_execution_t *out,vireo_mysql_error_t *e)
@@ -120,6 +131,11 @@ static vireo_result_t execute(vireo_mysql_thread_t *t,vireo_mysql_statement_t *s
     struct statement *s=(void *)statement;assert(t==thread);*e=(vireo_mysql_error_t){0};*out=(vireo_mysql_execution_t){0};
     if(s->op==BEGIN || s->op==COMMIT || s->op==ROLLBACK) { assert(!p && !n); }
     else if(s->op==USER || s->op==SESSION) { assert(n==1);u64(p,s->op==USER ? 7u : 51u); }
+    else if(s->op==RECEIPT_READ) { assert(n==2);u64(p,7);span(p+1,once_input.idempotency_key,16); }
+    else if(s->op==RECEIPT_INSERT) {
+        assert(n==6);u64(p,7);span(p+1,once_input.idempotency_key,16);u64(p+2,once_input.node_id);
+        u64(p+3,once_input.node_id);u64(p+4,501);u64(p+5,m.first_ms);
+    }
     else if(s->op==SOURCE || s->op==ANCESTOR) {
         assert(n==2);u64(p,7);assert(p[1].kind==VIREO_MYSQL_PARAMETER_U64);
         uint64_t id=p[1].value.u64;if(s->op==SOURCE) { assert(id==input.node_id); }
@@ -138,27 +154,28 @@ static vireo_result_t execute(vireo_mysql_thread_t *t,vireo_mysql_statement_t *s
     } else if(s->op==UPDATE_OBJECT) {
         assert(n==5 && m.refs);u64(p,m.refs-1);u64(p+1,m.first_ms>m.object_updated ? m.first_ms : m.object_updated);
         span(p+2,find(input.node_id)->hash,32);u64(p+3,m.refs);u64(p+4,m.object_state);
-    } else { assert(n==5);span(p,input.request_id,16);u64(p+1,7);u64(p+2,51);u64(p+3,input.node_id);u64(p+4,m.first_ms); }
+    } else { assert(n==5);const unsigned char *request=m.prepared[RECEIPT_READ] ? once_input.request_id : input.request_id;span(p,request,16);u64(p+1,7);u64(p+2,51);u64(p+3,m.prepared[RECEIPT_READ] ? once_input.node_id : input.node_id);u64(p+4,m.first_ms); }
     bool failed=fail() || m.execute_error==(int)s->op;out->execution_started=!(failed && m.before_native);
     if(failed) {
         if(s->op==COMMIT && m.apply_failed_commit) { apply_commit(); }
         e->mysql_code=(m.execute_error==(int)s->op && s->op>=UPDATE_NODE && s->op<=AUDIT) ? 1062u : 2013u;return VIREO_RESULT_DATABASE;
     }
-    out->has_result=s->op>=USER && s->op<=OBJECT;
+    out->has_result=(s->op>=USER && s->op<=OBJECT) || s->op==RECEIPT_READ;
     if(s->op>=UPDATE_NODE && s->op<=AUDIT) {
         out->affected_rows=1;out->insert_id=s->op==AUDIT ? 501u : 0u;
         if(s->op==UPDATE_NODE) { ++m.pending_nodes; }else if(s->op==UPDATE_OBJECT) { ++m.pending_objects; }else { ++m.pending_audits; }
         if(m.shape_op==(int)s->op) { if(m.shape==20) { out->affected_rows=0; }if(m.shape==21) { out->affected_rows=2; }if(m.shape==22) { out->insert_id=0; } }
     }
+    if(s->op==RECEIPT_INSERT) { out->affected_rows=1; ++m.pending_receipts; }
     if(s->op==COMMIT) { apply_commit(); }
-    if(s->op==ROLLBACK) { m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0; }
+    if(s->op==ROLLBACK) { m.pending_nodes=0;m.pending_audits=0;m.pending_objects=0;m.pending_receipts=0; }
     if(m.bad_result==(int)s->op) { out->has_result=!out->has_result; }return VIREO_OK;
 }
 static vireo_result_t fetch(vireo_mysql_thread_t *t,vireo_mysql_statement_t *statement,vireo_mysql_fetch_outcome_t *out,vireo_mysql_error_t *e)
 {
     struct statement *s=(void *)statement;assert(t==thread);*e=(vireo_mysql_error_t){0};if(fail()) { e->mysql_code=2013;return VIREO_RESULT_DATABASE; }
-    bool missing=(s->op==USER && m.missing_user)||(s->op==SESSION && m.missing_session)||(s->op>=SOURCE && s->op<=CHILDREN && !s->node)||(s->op==OBJECT && m.missing_object);
-    size_t rows=missing ? 0 : (m.duplicate==(int)s->op ? 2u : 1u);
+    bool missing=(s->op==USER && m.missing_user)||(s->op==SESSION && m.missing_session)||(s->op>=SOURCE && s->op<=CHILDREN && !s->node)||(s->op==OBJECT && m.missing_object)||(s->op==RECEIPT_READ && !m.receipt_found);
+    size_t rows=missing ? 0 : (m.duplicate==(int)s->op ? 2u : (s->op==RECEIPT_READ && m.receipt_duplicate ? 2u : 1u));
     *out=s->fetched++<rows ? VIREO_MYSQL_FETCH_ROW : VIREO_MYSQL_FETCH_DONE;return VIREO_OK;
 }
 static vireo_result_t column(vireo_mysql_thread_t *t,const vireo_mysql_statement_t *statement,size_t i,vireo_mysql_cell_view_t *out)
@@ -166,7 +183,17 @@ static vireo_result_t column(vireo_mysql_thread_t *t,const vireo_mysql_statement
     struct statement *s=(void *)statement;assert(t==thread);if(fail()) { return VIREO_RESULT_DATABASE; }
     static const char *const user[]={"7","1"},*const session[]={"51","7","1","1000","3000",NULL,"1000"};
     const unsigned char *v=NULL;size_t length=0;bool num=false;uint64_t number=0;struct node *a=s->node;
-    if(s->op==USER || s->op==SESSION) {
+    if(s->op==RECEIPT_READ) {
+        num=true;
+        if(i==0) number=7;
+        if(i==1) number=1028;
+        if(i==2) { num=false;v=once_input.idempotency_key;length=16; }
+        if(i==3) number=1;
+        if(i==4) number=m.receipt_malformed ? 0 : m.receipt_node;
+        if(i==5) number=m.receipt_node;
+        if(i==6) number=m.receipt_audit;
+        if(i==7) number=m.receipt_created;
+    } else if(s->op==USER || s->op==SESSION) {
         const char *c=s->op==USER ? user[i] : session[i];
         if(s->op==USER && i==1 && m.disabled) { c="2"; }
         if(s->op==SESSION) { if(i==1 && m.wrong_session) { c="8"; }if(i==2 && m.revoked) { c="2"; }if(i==5 && m.revoked) { c="1000"; } }
@@ -226,7 +253,7 @@ static vireo_result_t close_statement(vireo_mysql_thread_t *t,vireo_mysql_statem
 }
 static int utc(struct timespec *out)
 {
-    assert(m.prepared[SOURCE] && !m.statements);++m.utc_calls;
+    assert((m.prepared[SOURCE] || m.prepared[RECEIPT_READ]) && !m.statements);++m.utc_calls;
     if(fail() || m.utc_mode==m.utc_calls) { errno=EIO;return -1; }
     uint64_t ms=m.utc_calls==1 ? m.first_ms : m.second_ms;
     *out=(struct timespec){.tv_sec=(time_t)(ms/1000),.tv_nsec=(long)(ms%1000)*1000000L};
@@ -241,6 +268,7 @@ static void start(void)
     m.refs=2;m.object_size=91;m.object_state=2;m.object_created=1000;m.object_updated=1500;m.verified=1000;
     (void)add(22,0,"");file(add(31,22,"abc"));
     input=(vireo_mysql_node_soft_delete_input_t){.node_id=31,.request_id={1}};
+    once_input=(vireo_mysql_node_remove_once_input_t){.node_id=31,.idempotency_key={0x42},.request_id={0x77}};
     CHECK(vireo_mysql_node_repository_create_with_ops(thread,pool,&repo,&error,&ops),VIREO_OK);m.calls=0;++scenarios;
 }
 static void directory(void) { struct node *v=find(31);v->kind=1;v->size=0;memset(v->hash,0,32); }
@@ -263,6 +291,13 @@ static void stop(void)
     assert(m.allocations==1);m.fail_at=0;m.keep_release=false;m.consume_release_error=false;m.keep_close=-1;m.close_error=-1;m.execute_error=-1;
     CHECK(vireo_mysql_node_repository_destroy(&repo,NULL),VIREO_OK);assert(!repo && !m.allocations && !m.leases && !m.statements);
 }
+static vireo_result_t run_once(void)
+{
+    memset(&once_report,0xa5,sizeof(once_report)); errno=EDOM;
+    vireo_result_t rc=vireo_mysql_node_repository_soft_delete_once(repo,&actor,&once_input,0,&once_report,&error);
+    assert(errno==EDOM);
+    return rc;
+}
 static void reject(vireo_result_t want,vireo_mysql_node_issue_t issue)
 { CHECK(run(),want);assert(report.issue==issue && report.rollback_confirmed && !m.nodes && !m.objects && !m.audits && !m.prepared[UPDATE_NODE] && !m.prepared[AUDIT]); }
 static void *wrong_thread(void *unused)
@@ -275,6 +310,48 @@ static void chain(size_t count)
 int main(void)
 {
     thread=(void *)&thread_storage;pool=(void *)&pool_storage;
+    start();
+    CHECK(run_once(),VIREO_OK);
+    assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED && once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED &&
+        once_report.node_id==31 && once_report.audit_id==501 && once_report.deleted_at_ms==2000 && m.receipts==1 && m.nodes==1 && m.audits==1);
+    stop();
+    start();m.receipt_found=true;m.receipt_node=31;m.receipt_audit=501;m.receipt_created=1999;
+    CHECK(run_once(),VIREO_OK);
+    assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_RECOVERED && once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_NOT_COMMITTED &&
+        once_report.node_id==31 && once_report.audit_id==501 && once_report.deleted_at_ms==1999 && once_report.rollback_confirmed && !m.prepared[UPDATE_NODE]);
+    stop();
+    start();m.receipt_found=true;m.receipt_node=31;m.receipt_audit=501;m.receipt_created=2002;
+    CHECK(run_once(),VIREO_OK);assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_RECOVERED && once_report.deleted_at_ms==2002);stop();
+    start();m.receipt_found=true;m.receipt_node=32;m.receipt_audit=501;m.receipt_created=1999;
+    CHECK(run_once(),VIREO_RESULT_DATABASE);assert(once_report.issue==VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT && once_report.rollback_confirmed);stop();
+    start();m.receipt_found=true;m.receipt_node=31;m.receipt_audit=501;m.receipt_created=1999;m.receipt_malformed=true;
+    CHECK(run_once(),VIREO_RESULT_DATABASE);assert(once_report.issue==VIREO_MYSQL_NODE_RECEIPT_INVALID && once_report.rollback_confirmed);stop();
+    start();m.receipt_found=true;m.receipt_node=31;m.receipt_audit=501;m.receipt_created=1999;m.receipt_duplicate=true;
+    CHECK(run_once(),VIREO_RESULT_DATABASE);assert(once_report.issue==VIREO_MYSQL_NODE_RECEIPT_INVALID && once_report.rollback_confirmed);stop();
+    for(int op=RECEIPT_READ;op<=RECEIPT_INSERT;op+=RECEIPT_INSERT-RECEIPT_READ) {
+        start();m.execute_error=op;CHECK(run_once(),VIREO_RESULT_DATABASE);assert(once_report.rollback_confirmed && once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_NONE);stop();
+    }
+    start();m.receipt_found=true;m.receipt_node=31;m.receipt_audit=501;m.receipt_created=1999;m.utc_mode=1;
+    CHECK(run_once(),VIREO_RESULT_IO);assert(once_report.rollback_confirmed && once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_NONE);stop();
+    start();m.execute_error=COMMIT;CHECK(run_once(),VIREO_RESULT_DATABASE);
+    assert(once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_UNKNOWN && once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_NONE &&
+        !once_report.rollback_confirmed && m.disposition==VIREO_MYSQL_POOL_DISCARD && !m.prepared[ROLLBACK]);stop();
+    start();m.keep_close=RECEIPT_READ;CHECK(run_once(),VIREO_RESULT_BUSY);assert(once_report.cleanup_pending);stop();
+    start();m.keep_release=true;CHECK(run_once(),VIREO_RESULT_INTERNAL);
+    assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED && once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED && once_report.cleanup_pending);stop();
+    start();m.consume_release_error=true;CHECK(run_once(),VIREO_RESULT_DATABASE);
+    assert(once_report.effect==VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED && once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED && !once_report.cleanup_pending);stop();
+    start();m.receipt_found=true;m.receipt_node=32;m.receipt_audit=501;m.receipt_created=1999;m.execute_error=ROLLBACK;
+    CHECK(run_once(),VIREO_RESULT_DATABASE);assert(once_report.issue==VIREO_MYSQL_NODE_IDEMPOTENCY_CONFLICT && !once_report.rollback_confirmed);stop();
+    size_t once_points;
+    start();CHECK(run_once(),VIREO_OK);once_points=m.calls;stop();
+    for(size_t at=1;at<=once_points;++at) {
+        start();m.fail_at=at;vireo_result_t injected=run_once();assert(injected!=VIREO_OK);
+        assert(once_report.effect!=VIREO_MYSQL_NODE_REMOVE_EFFECT_APPLIED || once_report.commit==VIREO_MYSQL_NODE_SOFT_DELETE_COMMITTED);
+        stop();
+    }
+    start();memset(once_input.idempotency_key,0,sizeof(once_input.idempotency_key));
+    CHECK(run_once(),VIREO_RESULT_INVALID_ARGUMENT);assert(!m.calls);stop();
     size_t points[3];
     for(unsigned mode=0;mode<3;++mode) {
         start();if(mode) { directory(); }if(mode==2) { (void)add(91,31,"child"); }

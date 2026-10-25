@@ -23,6 +23,7 @@ typedef struct vireo_auth_process_options {
     size_t list_completion_allocation_budget; /**< 0保留旧五/六命令；正值要求ROOT启用，生产32768。 */
     size_t mkdir_completion_allocation_budget; /**< 0保留旧模式；正值要求LIST，生产4096。 */
     size_t move_completion_allocation_budget; /**< 0保留旧模式；正值须MKDIR启用，生产4096。 */
+    size_t remove_completion_allocation_budget; /**< 0保留MOVE模式；正值须MOVE启用，生产4096。 */
 } vireo_auth_process_options_t;
 /** 首因阶段，无路径、秘密、原生错误文本。 */
 typedef enum vireo_auth_process_phase {
@@ -41,12 +42,13 @@ typedef struct vireo_auth_process_report {
     vireo_auth_failure_writer_report_t audit_writer;
     vireo_auth_failure_audit_info_t audit_queue;
     unsigned stat_faults_at_stop, stat_final_faults; /**< STAT独立故障域，不能与原认证位混为同一值。 */
-    unsigned queues_closed, queues_drained; /**< 独立确认位：task=1、auth=2、STAT=4、ROOT=8、LIST=16、MKDIR=32、MOVE=64；drained在join后观察。 */
+    unsigned queues_closed, queues_drained; /**< 独立确认位：task=1、auth=2、STAT=4、ROOT=8、LIST=16、MKDIR=32、MOVE=64、REMOVE=128；drained在join后观察。 */
     size_t final_drain_turns; /**< join后无条件推进的有界服务轮数，不按notifier提示决定。 */
     unsigned root_faults_at_stop, root_final_faults; /**< ROOT独立永久故障域。 */
     unsigned mkdir_faults_at_stop, mkdir_final_faults; /**< MKDIR独立永久故障域。 */
     unsigned list_faults_at_stop, list_final_faults; /**< LIST独立永久故障域。 */
     unsigned move_faults_at_stop, move_final_faults; /**< MOVE独立永久故障域。 */
+    unsigned remove_faults_at_stop, remove_final_faults; /**< REMOVE独立永久故障域。 */
 } vireo_auth_process_report_t;
 /**
  * @brief 主线程同步装配、运行及清退认证四命令与已启用目录命令进程。

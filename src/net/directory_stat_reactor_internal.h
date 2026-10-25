@@ -10,6 +10,7 @@
 #include <vireo/net/client_deadline.h>
 #include <vireo/protocol/node_mkdir.h>
 #include <vireo/protocol/node_move.h>
+#include <vireo/protocol/node_remove.h>
 
 /** 每客户一个timer指向phase/frame的较早期限；完整绑定兼顾两种代次。 */
 typedef struct vireo_auth_client_deadline {
@@ -96,7 +97,9 @@ typedef struct vireo_root_reactor_ops {
 typedef struct vireo_list_reactor_state vireo_list_reactor_state_t;
 typedef struct vireo_mkdir_reactor_state vireo_mkdir_reactor_state_t;
 typedef struct vireo_move_reactor_state vireo_move_reactor_state_t;
+typedef struct vireo_remove_reactor_state vireo_remove_reactor_state_t;
 struct vireo_auth_service {
+    vireo_remove_reactor_state_t *remove; /**< 仅十命令NODE_REMOVE模式存在。 */
     vireo_move_reactor_state_t *move; /**< 仅九命令模式存在，其他模式NULL。 */
     vireo_mkdir_reactor_state_t *mkdir; /**< NULL为原四至七命令模式。 */
     vireo_list_reactor_state_t *list; /**< NULL为旧四/五/六模式。 */
@@ -137,9 +140,9 @@ struct vireo_auth_service {
 
 /** 共同framing可观察上界；命令专用上界在完整header后立即验证。 */
 static inline size_t vireo_auth_frame_max(vireo_auth_service_t const *s)
-{ return s->move?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:s->mkdir?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
+{ return s->remove?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:s->move?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:s->mkdir?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
 static inline size_t vireo_auth_command_frame_max(vireo_auth_service_t const *s,vireo_command_t command)
-{ return s->move && command==VIREO_COMMAND_NODE_MOVE?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:s->mkdir && command==VIREO_COMMAND_NODE_MKDIR?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
+{ return s->remove && command==VIREO_COMMAND_NODE_REMOVE?VIREO_NODE_REMOVE_REQUEST_FRAME_SIZE:s->move && command==VIREO_COMMAND_NODE_MOVE?VIREO_NODE_MOVE_REQUEST_FRAME_MAX:s->mkdir && command==VIREO_COMMAND_NODE_MKDIR?VIREO_NODE_MKDIR_REQUEST_FRAME_MAX:VIREO_AUTH_REQUEST_FRAME_MAX; }
 
 /** 本层统一关闭意图，幂等记账；release成功后才归还closing_count。 */
 static inline void vireo_auth_service_close_slot(vireo_auth_service_t *s,client_slot_t *slot)
